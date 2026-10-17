@@ -1,9 +1,11 @@
+import base64
 import hmac
+import io
 import json
 from datetime import datetime, timezone
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 import pandas as pd
 import streamlit as st
@@ -25,6 +27,25 @@ MARKETS = {
     "Receptions": "player_receptions",
 }
 
+DATASETS = {
+    "Defensive Man/Zone Coverage": "defensive_coverage",
+    "RB vs. Gap Runs": "rb_gap",
+    "RB vs. Zone Runs": "rb_zone",
+    "Full RB Stats / Receiving": "rb_full",
+    "WR vs. Man": "wr_man",
+    "WR vs. Zone": "wr_zone",
+    "TE vs. Man": "te_man",
+    "TE vs. Zone": "te_zone",
+    "QB vs. Man": "qb_man",
+    "QB vs. Zone": "qb_zone",
+    "Defense vs. Zone/Gap Runs": "defensive_run_splits",
+    "CBS Stats Allowed — QB": "cbs_allowed_qb",
+    "CBS Stats Allowed — RB": "cbs_allowed_rb",
+    "CBS Stats Allowed — WR": "cbs_allowed_wr",
+    "CBS Stats Allowed — TE": "cbs_allowed_te",
+    "Weekly Schedule / Opponents": "weekly_schedule",
+}
+
 PROP_COLUMNS = [
     "Player",
     "Matchup",
@@ -44,12 +65,22 @@ def get_secret(name):
         return ""
 
 
+def is_admin():
+    entered = st.session_state.get("admin_password", "")
+    expected = get_secret("ADMIN_PASSWORD")
+
+    return bool(expected) and hmac.compare_digest(
+        entered.encode("utf-8"),
+        expected.encode("utf-8"),
+    )
+
+
 def odds_request(path, parameters):
     api_key = get_secret("ODDS_API_KEY")
 
     if not api_key:
         raise RuntimeError(
-            "ODDS_API_KEY is missing from Streamlit Secrets."
+            "Add ODDS_API_KEY to Streamlit Secrets."
         )
 
     query = urlencode({**parameters, "apiKey": api_key})
@@ -65,10 +96,10 @@ def odds_request(path, parameters):
 
     except HTTPError as error:
         messages = {
-            401: "The API key was rejected. Check Streamlit Secrets.",
-            403: "The provider denied access. Check your API plan.",
-            422: "The provider rejected the requested game or markets.",
-            429: "The API quota or request limit has been reached.",
+            401: "The Odds API rejected the API key.",
+            403: "The Odds API denied access. Check your plan.",
+            422: "The requested game or markets are unavailable.",
+            429: "The API quota or request limit was reached.",
         }
         raise RuntimeError(
             messages.get(
@@ -77,14 +108,10 @@ def odds_request(path, parameters):
             )
         ) from None
 
-    except (URLError, TimeoutError, OSError):
+    except (URLError, TimeoutError, OSError, ValueError):
         raise RuntimeError(
-            "Could not connect to the data provider. Try again later."
-        ) from None
-
-    except ValueError:
-        raise RuntimeError(
-            "The provider returned an unreadable response."
+            "Could not load data from The Odds API. "
+            "Try again later."
         ) from None
 
 
@@ -118,6 +145,7 @@ def load_props(event_id):
     fetched_at = datetime.now(timezone.utc).strftime(
         "%Y-%m-%d %H:%M UTC"
     )
+
     return data, remaining, fetched_at
 
 
@@ -154,9 +182,10 @@ def props_to_table(data):
                         "Side": outcome.get("name"),
                         "Line": outcome.get("point"),
                         "Odds": outcome.get("price"),
-                        "Updated (UTC)": market.get(
-                            "last_update"
-                        ) or bookmaker.get("last_update"),
+                        "Updated (UTC)": (
+                            market.get("last_update")
+                            or bookmaker.get("last_update")
+                        ),
                     }
                 )
 
@@ -164,20 +193,14 @@ def props_to_table(data):
 
 
 def import_selected_game():
-    """Runs before the page renders when the button is clicked."""
-    event_id = st.session_state.get("selected_event_id")
-    entered = st.session_state.get("admin_password", "")
-    expected = get_secret("ADMIN_PASSWORD")
-
-    if not expected or not hmac.compare_digest(
-        entered.encode("utf-8"),
-        expected.encode("utf-8"),
-    ):
+    if not is_admin():
         st.session_state.import_notice = (
             "error",
             "Enter the correct admin password first.",
         )
         return
+
+    event_id = st.session_state.get("selected_event_id")
 
     if not event_id:
         st.session_state.import_notice = (
@@ -198,8 +221,7 @@ def import_selected_game():
             st.session_state.import_notice = (
                 "warning",
                 "No DraftKings props were returned for these "
-                "categories. They may not be posted yet or "
-                "available through this feed.",
+                "categories. They may not be posted yet.",
             )
         else:
             st.session_state.import_notice = (
@@ -213,6 +235,129 @@ def import_selected_game():
             "error",
             str(error),
         )
+
+
+def github_file_request(path, payload=None):
+    token = get_secret("GITHUB_TOKEN")
+    repo = get_secret("GITHUB_REPO")
+    branch = get_secret("GITHUB_BRANCH") or "main"
+
+    if not token or not repo:
+        raise RuntimeError(
+            "Add GITHUB_TOKEN and GITHUB_REPO "
+            "to Streamlit Secrets."
+        )
+
+    url = (
+        f"https://api.github.com/repos/{repo}"
+        f"/contents/{path}"
+    )
+
+    if payload is None:
+        url += "?" + urlencode({"ref": branch})
+
+    request = Request(
+        url,
+        data=(
+            json.dumps(payload).encode("utf-8")
+            if payload is not None
+            else None
+        ),
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "Content-Type": "application/json",
+            "User-Agent": "NFL-Matchup-Analytics",
+        },
+        method="PUT" if payload is not None else "GET",
+    )
+
+    try:
+        with urlopen(request, timeout=30) as response:
+            return json.load(response)
+
+    except HTTPError as error:
+        if error.code == 404 and payload is None:
+            return None
+
+        messages = {
+            401: "GitHub rejected the token. Check its expiration.",
+            403: (
+                "GitHub denied access. Check that the token has "
+                "Contents: Read and write."
+            ),
+            404: (
+                "Check the repository name and the token's "
+                "repository access."
+            ),
+            409: (
+                "The repository changed during saving. "
+                "Try saving again."
+            ),
+            422: (
+                "GitHub rejected the save. Check the branch "
+                "name and its permissions."
+            ),
+        }
+
+        raise RuntimeError(
+            messages.get(
+                error.code,
+                f"GitHub returned HTTP {error.code}.",
+            )
+        ) from None
+
+    except (URLError, TimeoutError, OSError, ValueError):
+        raise RuntimeError(
+            "Could not complete the GitHub request. "
+            "Check the repository before retrying a save."
+        ) from None
+
+
+def save_dataset(dataset, table):
+    if not is_admin():
+        raise RuntimeError("Admin access is required.")
+
+    path = f"data/{DATASETS[dataset]}.csv"
+    existing = github_file_request(path)
+
+    content = table.to_csv(index=False).encode("utf-8")
+
+    payload = {
+        "message": f"Update {dataset}",
+        "content": base64.b64encode(content).decode("ascii"),
+        "branch": get_secret("GITHUB_BRANCH") or "main",
+    }
+
+    if existing is not None:
+        if not isinstance(existing, dict) or "sha" not in existing:
+            raise RuntimeError("Unexpected GitHub file response.")
+        payload["sha"] = existing["sha"]
+
+    github_file_request(path, payload)
+    return path
+
+
+def read_saved_dataset(dataset):
+    path = f"data/{DATASETS[dataset]}.csv"
+    saved = github_file_request(path)
+
+    if saved is None:
+        return None
+
+    try:
+        content = base64.b64decode(saved["content"])
+        return pd.read_csv(io.BytesIO(content))
+    except (
+        ValueError,
+        KeyError,
+        TypeError,
+        UnicodeError,
+        pd.errors.ParserError,
+    ):
+        raise RuntimeError(
+            "The saved CSV could not be read."
+        ) from None
 
 
 if "imported_props" not in st.session_state:
@@ -251,9 +396,8 @@ with weekly:
     st.header("Projections & Matchups")
 
     st.info(
-        "No projections published yet. "
-        "The model and weekly statistics imports are "
-        "under development."
+        "No projections published yet. Saved statistics "
+        "are not connected to the model yet."
     )
 
     st.dataframe(
@@ -273,39 +417,68 @@ with weekly:
     )
 
     st.subheader("Planned analysis")
-
     st.markdown(
         """
-        - **Receiving:** performance against man and zone
-          coverage, combined with opponent coverage tendencies.
+        - **Receiving:** player performance against man and zone,
+          combined with opponent coverage tendencies.
         - **Rushing:** performance on zone and gap runs,
           combined with offensive usage and defensive efficiency.
-        - **Workload:** opportunities used to translate
-          efficiency into projected game totals.
+        - **Workload:** routes, targets, carries, and games played
+          used to translate efficiency into game totals.
+        - **Opponent:** defensive stats allowed by position.
         """
     )
+
+    with st.expander("View published statistics"):
+        published_dataset = st.selectbox(
+            "Choose a saved dataset",
+            list(DATASETS),
+            key="public_dataset",
+        )
+
+        if st.button(
+            "Load published table",
+            key="load_public_table",
+        ):
+            try:
+                with st.spinner("Loading saved statistics..."):
+                    published = read_saved_dataset(
+                        published_dataset
+                    )
+
+                if published is None:
+                    st.info(
+                        "No file found for this category. "
+                        "It may not have been uploaded yet."
+                    )
+                else:
+                    st.dataframe(
+                        published,
+                        hide_index=True,
+                        use_container_width=True,
+                    )
+            except RuntimeError as error:
+                st.error(str(error))
 
 
 with comparisons:
     st.header("Prop Comparisons")
 
     st.caption(
-        "The model is not connected yet. These are imported "
-        "sportsbook lines, not model recommendations."
+        "The projection model is not connected yet. "
+        "These are imported sportsbook lines."
     )
 
     props = st.session_state.imported_props
 
     if props.empty:
         st.info(
-            "No props loaded in this session. Go to "
-            "Admin / Update Data, enter your password, "
-            "choose a game, and load its props."
+            "No props loaded in this session. Open "
+            "Admin / Update Data to import a game's props."
         )
     else:
         st.write(
-            f"**Fetched:** "
-            f"{st.session_state.props_fetched_at}"
+            f"**Fetched:** {st.session_state.props_fetched_at}"
         )
 
         categories = sorted(
@@ -364,8 +537,7 @@ with comparisons:
         )
 
     st.caption(
-        "Imported data currently stays in your session only. "
-        "Permanent publishing will be added separately."
+        "DraftKings imports currently stay in your session only."
     )
 
 
@@ -373,8 +545,8 @@ with results:
     st.header("Results Tracker")
 
     st.info(
-        "No predictions saved yet. Permanent history "
-        "and results tracking are not implemented."
+        "Prediction history and results tracking "
+        "are not connected yet."
     )
 
     st.dataframe(
@@ -410,32 +582,31 @@ with methodology:
     )
 
     st.subheader("Research question")
-
     st.write(
-        "Does defensive scheme information improve player "
-        "forecasts compared with season averages?"
+        "Does defensive scheme information improve "
+        "player forecasts compared with season averages?"
     )
 
-    st.subheader("Planned inputs")
-
+    st.subheader("Inputs")
     st.markdown(
         """
         - Defensive man and zone coverage frequencies.
         - QB, WR, and TE performance against those coverages.
         - RB performance on zone and gap runs.
+        - Full RB statistics, including receiving.
         - Defensive performance against zone and gap runs.
-        - Offensive scheme usage, player workload, and opponents.
+        - CBS defensive stats allowed by position.
+        - Player workload and weekly opponents.
         """
     )
 
     st.subheader("Evaluation")
-
     st.markdown(
         """
-        - Use only information available before kickoff.
-        - Record the season and data cutoff for each upload.
-        - Save predictions before games begin.
-        - Compare predictions with actual results and a baseline.
+        - Use information available before kickoff.
+        - Record the season and data cutoff.
+        - Preserve pregame predictions.
+        - Compare forecasts with actual results and a baseline.
         - Consider sample sizes when interpreting splits.
         """
     )
@@ -450,12 +621,6 @@ with methodology:
 with admin:
     st.header("Admin / Update Data")
 
-    st.info(
-        "The DraftKings import is available below. "
-        "Weekly statistics uploads and permanent storage "
-        "are not connected yet."
-    )
-
     st.text_input(
         "Admin password",
         type="password",
@@ -467,107 +632,22 @@ with admin:
         "admin_password", ""
     )
 
-    authenticated = bool(expected_password) and (
-        hmac.compare_digest(
-            entered_password.encode("utf-8"),
-            expected_password.encode("utf-8"),
-        )
-    )
-
     if not expected_password:
         st.warning(
             "Add ADMIN_PASSWORD to Streamlit Secrets."
         )
-    elif entered_password and not authenticated:
+    elif entered_password and not is_admin():
         st.error("Incorrect password.")
 
-    if authenticated:
+    if is_admin():
         st.success("Admin access enabled.")
-                st.subheader("Weekly Statistics Upload")
 
-        import base64
-        import io
-        from urllib.request import Request
+        st.subheader("Weekly Statistics Upload")
 
-        DATASETS = {
-            "Defensive Man/Zone Coverage": "defensive_coverage",
-            "RB vs. Gap Runs": "rb_gap",
-            "RB vs. Zone Runs": "rb_zone",
-            "Full RB Stats / Receiving": "rb_full",
-            "WR vs. Man": "wr_man",
-            "WR vs. Zone": "wr_zone",
-            "TE vs. Man": "te_man",
-            "TE vs. Zone": "te_zone",
-            "QB vs. Man": "qb_man",
-            "QB vs. Zone": "qb_zone",
-            "Defense vs. Zone/Gap Runs": "defensive_run_splits",
-            "CBS Stats Allowed — QB": "cbs_allowed_qb",
-            "CBS Stats Allowed — RB": "cbs_allowed_rb",
-            "CBS Stats Allowed — WR": "cbs_allowed_wr",
-            "CBS Stats Allowed — TE": "cbs_allowed_te",
-            "Weekly Schedule / Opponents": "weekly_schedule",
-        }
-
-        def github_file_request(path, payload=None):
-            token = get_secret("GITHUB_TOKEN")
-            repo = get_secret("GITHUB_REPO")
-            branch = get_secret("GITHUB_BRANCH") or "main"
-
-            if not token or not repo:
-                raise RuntimeError(
-                    "Add GITHUB_TOKEN and GITHUB_REPO "
-                    "to Streamlit Secrets."
-                )
-
-            url = (
-                f"https://api.github.com/repos/{repo}"
-                f"/contents/{path}"
-            )
-
-            if payload is None:
-                url += "?" + urlencode({"ref": branch})
-
-            request = Request(
-                url,
-                data=(
-                    json.dumps(payload).encode("utf-8")
-                    if payload is not None else None
-                ),
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Accept": "application/vnd.github+json",
-                    "Content-Type": "application/json",
-                    "User-Agent": "NFL-Matchup-Analytics",
-                },
-                method="PUT" if payload is not None else "GET",
-            )
-
-            try:
-                with urlopen(request, timeout=30) as response:
-                    return json.load(response)
-            except HTTPError as error:
-                if error.code == 404 and payload is None:
-                    return None
-
-                messages = {
-                    401: "GitHub rejected the token. Check its expiration.",
-                    403: "Check the token's Contents permission: Read and write.",
-                    404: "Check the repository name and token's repository access.",
-                    409: "The file changed during saving. Try saving again.",
-                    422: "GitHub rejected the save. Check branch permissions.",
-                }
-
-                raise RuntimeError(
-                    messages.get(
-                        error.code,
-                        f"GitHub returned HTTP {error.code}.",
-                    )
-                ) from None
-            except (URLError, TimeoutError, OSError, ValueError):
-                raise RuntimeError(
-                    "Could not complete the GitHub request. "
-                    "Check the repository before retrying a save."
-                ) from None
+        st.write(
+            "Choose a category, upload its CSV, review "
+            "the preview, and save it to GitHub."
+        )
 
         dataset = st.selectbox(
             "Which table are you uploading?",
@@ -575,11 +655,11 @@ with admin:
             key="weekly_dataset",
         )
 
-        save_path = f"data/{DATASETS[dataset]}.csv"
-
         st.caption(
             "Saving updates this category only. "
-            "Previous versions remain in GitHub history."
+            "Earlier versions remain in GitHub history. "
+            "Saved tables are visible under Projections "
+            "& Matchups → View published statistics."
         )
 
         uploaded_file = st.file_uploader(
@@ -588,30 +668,37 @@ with admin:
             key="weekly_stats_file",
         )
 
-        if uploaded_file is not None:
-            preview = None
+        preview = None
 
+        if uploaded_file is not None:
             try:
                 if uploaded_file.size > 500_000:
-                    st.error("Please use a CSV smaller than 500 KB.")
+                    st.error(
+                        "Please use a CSV smaller than 500 KB."
+                    )
                 else:
                     preview = pd.read_csv(
                         io.BytesIO(uploaded_file.getvalue())
                     )
 
                     if preview.empty:
-                        st.error("This file has no data rows.")
+                        st.error(
+                            "This file contains no data rows."
+                        )
                         preview = None
                     else:
                         st.write(
-                            f"**{dataset}:** {len(preview)} rows, "
+                            f"**{dataset}:** "
+                            f"{len(preview)} rows, "
                             f"{len(preview.columns)} columns"
                         )
+
                         st.dataframe(
                             preview,
                             hide_index=True,
                             use_container_width=True,
                         )
+
             except (
                 pd.errors.ParserError,
                 pd.errors.EmptyDataError,
@@ -622,69 +709,44 @@ with admin:
                     "UTF-8 CSV with column headings."
                 )
 
-            if preview is not None:
-                st.caption(
-                    "Check that the preview matches the selected "
-                    "category before saving."
-                )
+        if preview is not None:
+            st.caption(
+                "Check that this file matches the selected "
+                "category before saving. Required model "
+                "columns are not validated yet."
+            )
 
-                if st.button(
-                    "Save this table to GitHub",
-                    key="save_weekly_table",
-                ):
-                    try:
-                        with st.spinner("Saving table..."):
-                            existing = github_file_request(save_path)
-
-                            content = preview.to_csv(
-                                index=False
-                            ).encode("utf-8")
-
-                            payload = {
-                                "message": f"Update {dataset}",
-                                "content": base64.b64encode(
-                                    content
-                                ).decode("ascii"),
-                                "branch": (
-                                    get_secret("GITHUB_BRANCH")
-                                    or "main"
-                                ),
-                            }
-
-                            if existing is not None:
-                                payload["sha"] = existing["sha"]
-
-                            github_file_request(
-                                save_path, payload
-                            )
-
-                        st.success(
-                            f"Saved {dataset} permanently "
-                            f"to {save_path}."
+            if st.button(
+                "Save this table to GitHub",
+                type="primary",
+                key="save_weekly_table",
+            ):
+                try:
+                    with st.spinner("Saving table..."):
+                        saved_path = save_dataset(
+                            dataset, preview
                         )
-                    except RuntimeError as error:
-                        st.error(str(error))
+
+                    st.success(
+                        f"Saved permanently to {saved_path}."
+                    )
+                except RuntimeError as error:
+                    st.error(str(error))
 
         if st.button(
             "View saved table for this category",
             key="view_saved_table",
         ):
             try:
-                saved = github_file_request(save_path)
+                with st.spinner("Loading saved table..."):
+                    saved_table = read_saved_dataset(dataset)
 
-                if saved is None:
+                if saved_table is None:
                     st.info(
-                        "No saved file found. If you expected one, "
-                        "check the repository and token access."
+                        "No saved file found. If you expected "
+                        "one, check repository and token access."
                     )
                 else:
-                    saved_bytes = base64.b64decode(
-                        saved["content"]
-                    )
-                    saved_table = pd.read_csv(
-                        io.BytesIO(saved_bytes)
-                    )
-
                     st.write(f"**Saved table: {dataset}**")
                     st.dataframe(
                         saved_table,
@@ -693,77 +755,77 @@ with admin:
                     )
             except RuntimeError as error:
                 st.error(str(error))
-            except (ValueError, KeyError, UnicodeError):
-                st.error("The saved file could not be read.")
-
-        st.caption(
-            "Saved statistics are not connected to projections yet. "
-            "Column validation and the model come next."
-        )
 
         st.divider()
+
+        st.subheader("Import DraftKings Props")
+
+        st.caption(
+            "Imports stay in this session only. "
+            "Saving statistics above does not save props."
+        )
+
         try:
             with st.spinner("Loading available games..."):
                 events = load_events()
 
-            if not events:
+            event_map = {
+                event["id"]: event
+                for event in events
+                if isinstance(event, dict) and "id" in event
+            }
+
+            if not event_map:
                 st.info("No upcoming games are available.")
             else:
-                event_map = {
-                    event["id"]: event
-                    for event in events
-                    if "id" in event
-                }
-
-                if event_map:
-                    st.selectbox(
-                        "Choose one game",
-                        options=list(event_map),
-                        format_func=lambda event_id: (
-                            f"{event_map[event_id]['away_team']} at "
-                            f"{event_map[event_id]['home_team']} — "
-                            f"{event_map[event_id]['commence_time']}"
-                        ),
-                        key="selected_event_id",
-                    )
-
-                    st.caption(
-                        "Loads passing yards, rushing yards, "
-                        "receiving yards, and receptions. "
-                        "Identical imports are cached for one hour. "
-                        "A new request uses API credits."
-                    )
-
-                    st.button(
-                        "Load this game's DraftKings props",
-                        type="primary",
-                        on_click=import_selected_game,
-                    )
-
-                notice = st.session_state.import_notice
-
-                if notice:
-                    notice_type, message = notice
-
-                    if notice_type == "success":
-                        st.success(message)
-                    elif notice_type == "warning":
-                        st.warning(message)
-                    else:
-                        st.error(message)
-
-                remaining = (
-                    st.session_state.credits_remaining
+                st.selectbox(
+                    "Choose one game",
+                    options=list(event_map),
+                    format_func=lambda event_id: (
+                        f"{event_map[event_id].get('away_team', '')}"
+                        f" at "
+                        f"{event_map[event_id].get('home_team', '')}"
+                        f" — "
+                        f"{event_map[event_id].get('commence_time', '')}"
+                    ),
+                    key="selected_event_id",
                 )
 
-                if remaining is not None:
-                    st.caption(
-                        "API credits remaining when last fetched: "
-                        f"{remaining}"
-                    )
+                st.caption(
+                    "Loads passing yards, rushing yards, "
+                    "receiving yards, and receptions. "
+                    "Identical requests are cached for one hour. "
+                    "New requests use API credits."
+                )
+
+                st.button(
+                    "Load this game's DraftKings props",
+                    type="primary",
+                    on_click=import_selected_game,
+                )
 
         except RuntimeError as error:
             st.error(str(error))
+
+        notice = st.session_state.import_notice
+
+        if notice:
+            notice_type, message = notice
+
+            if notice_type == "success":
+                st.success(message)
+            elif notice_type == "warning":
+                st.warning(message)
+            else:
+                st.error(message)
+
+        remaining = st.session_state.credits_remaining
+
+        if remaining is not None:
+            st.caption(
+                "API credits remaining when last fetched: "
+                f"{remaining}"
+            )
 
 
 st.divider()
