@@ -385,10 +385,8 @@ with admin:
                                 "these categories. They may not be "
                                 "posted or available in this feed."
                             )
-                        else:
-                            st.success(
-                                f"Loaded {len(imported)} over/under "
-                                "outcomes. View them in Prop Comparisons."
+                                                else:
+                            st.rerun()
                             )
 
                         if remaining is not None:
