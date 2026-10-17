@@ -343,7 +343,10 @@ with comparisons:
             ]
 
         st.dataframe(
-            visible,
+            visible.drop(
+                columns=["Kickoff (UTC)", "Updated (UTC)"],
+                errors="ignore",
+            ),
             hide_index=True,
             use_container_width=True,
         )
