@@ -483,29 +483,103 @@ with admin:
 
     if authenticated:
         st.success("Admin access enabled.")
-        st.subheader("Weekly Statistics Upload")
+                st.subheader("Weekly Statistics Upload")
+
+        import base64
+        import io
+        from urllib.request import Request
+
+        DATASETS = {
+            "Defensive Man/Zone Coverage": "defensive_coverage",
+            "RB vs. Gap Runs": "rb_gap",
+            "RB vs. Zone Runs": "rb_zone",
+            "Full RB Stats / Receiving": "rb_full",
+            "WR vs. Man": "wr_man",
+            "WR vs. Zone": "wr_zone",
+            "TE vs. Man": "te_man",
+            "TE vs. Zone": "te_zone",
+            "QB vs. Man": "qb_man",
+            "QB vs. Zone": "qb_zone",
+            "Defense vs. Zone/Gap Runs": "defensive_run_splits",
+            "CBS Stats Allowed — QB": "cbs_allowed_qb",
+            "CBS Stats Allowed — RB": "cbs_allowed_rb",
+            "CBS Stats Allowed — WR": "cbs_allowed_wr",
+            "CBS Stats Allowed — TE": "cbs_allowed_te",
+            "Weekly Schedule / Opponents": "weekly_schedule",
+        }
+
+        def github_file_request(path, payload=None):
+            token = get_secret("GITHUB_TOKEN")
+            repo = get_secret("GITHUB_REPO")
+            branch = get_secret("GITHUB_BRANCH") or "main"
+
+            if not token or not repo:
+                raise RuntimeError(
+                    "Add GITHUB_TOKEN and GITHUB_REPO "
+                    "to Streamlit Secrets."
+                )
+
+            url = (
+                f"https://api.github.com/repos/{repo}"
+                f"/contents/{path}"
+            )
+
+            if payload is None:
+                url += "?" + urlencode({"ref": branch})
+
+            request = Request(
+                url,
+                data=(
+                    json.dumps(payload).encode("utf-8")
+                    if payload is not None else None
+                ),
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/vnd.github+json",
+                    "Content-Type": "application/json",
+                    "User-Agent": "NFL-Matchup-Analytics",
+                },
+                method="PUT" if payload is not None else "GET",
+            )
+
+            try:
+                with urlopen(request, timeout=30) as response:
+                    return json.load(response)
+            except HTTPError as error:
+                if error.code == 404 and payload is None:
+                    return None
+
+                messages = {
+                    401: "GitHub rejected the token. Check its expiration.",
+                    403: "Check the token's Contents permission: Read and write.",
+                    404: "Check the repository name and token's repository access.",
+                    409: "The file changed during saving. Try saving again.",
+                    422: "GitHub rejected the save. Check branch permissions.",
+                }
+
+                raise RuntimeError(
+                    messages.get(
+                        error.code,
+                        f"GitHub returned HTTP {error.code}.",
+                    )
+                ) from None
+            except (URLError, TimeoutError, OSError, ValueError):
+                raise RuntimeError(
+                    "Could not complete the GitHub request. "
+                    "Check the repository before retrying a save."
+                ) from None
 
         dataset = st.selectbox(
             "Which table are you uploading?",
-            [
-                "Defensive Man/Zone Coverage",
-                "RB vs. Gap Runs",
-                "RB vs. Zone Runs",
-                "Full RB Stats / Receiving",
-                "WR vs. Man",
-                "WR vs. Zone",
-                "TE vs. Man",
-                "TE vs. Zone",
-                "QB vs. Man",
-                "QB vs. Zone",
-                "Defense vs. Zone/Gap Runs",
-                "CBS Stats Allowed — QB",
-                "CBS Stats Allowed — RB",
-                "CBS Stats Allowed — WR",
-                "CBS Stats Allowed — TE",
-                "Weekly Schedule / Opponents",
-            ],
+            list(DATASETS),
             key="weekly_dataset",
+        )
+
+        save_path = f"data/{DATASETS[dataset]}.csv"
+
+        st.caption(
+            "Saving updates this category only. "
+            "Previous versions remain in GitHub history."
         )
 
         uploaded_file = st.file_uploader(
@@ -515,32 +589,117 @@ with admin:
         )
 
         if uploaded_file is not None:
+            preview = None
+
             try:
-                uploaded_file.seek(0)
-                preview = pd.read_csv(uploaded_file)
+                if uploaded_file.size > 500_000:
+                    st.error("Please use a CSV smaller than 500 KB.")
+                else:
+                    preview = pd.read_csv(
+                        io.BytesIO(uploaded_file.getvalue())
+                    )
 
-                st.write(
-                    f"**{dataset}:** "
-                    f"{len(preview)} rows, "
-                    f"{len(preview.columns)} columns"
-                )
-
-                st.dataframe(
-                    preview,
-                    hide_index=True,
-                    use_container_width=True,
-                )
-
-                st.info(
-                    "Preview only. This file has not been saved "
-                    "or connected to the projection model yet."
-                )
-
-            except Exception:
+                    if preview.empty:
+                        st.error("This file has no data rows.")
+                        preview = None
+                    else:
+                        st.write(
+                            f"**{dataset}:** {len(preview)} rows, "
+                            f"{len(preview.columns)} columns"
+                        )
+                        st.dataframe(
+                            preview,
+                            hide_index=True,
+                            use_container_width=True,
+                        )
+            except (
+                pd.errors.ParserError,
+                pd.errors.EmptyDataError,
+                UnicodeError,
+            ):
                 st.error(
-                    "Could not read this CSV. Check that it has "
-                    "column headings and was exported as CSV."
+                    "Could not read this CSV. Export it as "
+                    "UTF-8 CSV with column headings."
                 )
+
+            if preview is not None:
+                st.caption(
+                    "Check that the preview matches the selected "
+                    "category before saving."
+                )
+
+                if st.button(
+                    "Save this table to GitHub",
+                    key="save_weekly_table",
+                ):
+                    try:
+                        with st.spinner("Saving table..."):
+                            existing = github_file_request(save_path)
+
+                            content = preview.to_csv(
+                                index=False
+                            ).encode("utf-8")
+
+                            payload = {
+                                "message": f"Update {dataset}",
+                                "content": base64.b64encode(
+                                    content
+                                ).decode("ascii"),
+                                "branch": (
+                                    get_secret("GITHUB_BRANCH")
+                                    or "main"
+                                ),
+                            }
+
+                            if existing is not None:
+                                payload["sha"] = existing["sha"]
+
+                            github_file_request(
+                                save_path, payload
+                            )
+
+                        st.success(
+                            f"Saved {dataset} permanently "
+                            f"to {save_path}."
+                        )
+                    except RuntimeError as error:
+                        st.error(str(error))
+
+        if st.button(
+            "View saved table for this category",
+            key="view_saved_table",
+        ):
+            try:
+                saved = github_file_request(save_path)
+
+                if saved is None:
+                    st.info(
+                        "No saved file found. If you expected one, "
+                        "check the repository and token access."
+                    )
+                else:
+                    saved_bytes = base64.b64decode(
+                        saved["content"]
+                    )
+                    saved_table = pd.read_csv(
+                        io.BytesIO(saved_bytes)
+                    )
+
+                    st.write(f"**Saved table: {dataset}**")
+                    st.dataframe(
+                        saved_table,
+                        hide_index=True,
+                        use_container_width=True,
+                    )
+            except RuntimeError as error:
+                st.error(str(error))
+            except (ValueError, KeyError, UnicodeError):
+                st.error("The saved file could not be read.")
+
+        st.caption(
+            "Saved statistics are not connected to projections yet. "
+            "Column validation and the model come next."
+        )
 
         st.divider()
         try:
