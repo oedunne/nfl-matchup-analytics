@@ -483,7 +483,56 @@ with admin:
 
     if authenticated:
         st.success("Admin access enabled.")
+        st.subheader("Weekly Statistics Upload")
 
+        dataset = st.selectbox(
+            "Which table are you uploading?",
+            [
+                "TE vs. Man",
+                "TE vs. Zone",
+                "WR vs. Man",
+                "WR vs. Zone",
+                "Defensive Coverage",
+                "Other Statistics",
+            ],
+            key="weekly_dataset",
+        )
+
+        uploaded_file = st.file_uploader(
+            "Upload a CSV file",
+            type=["csv"],
+            key="weekly_stats_file",
+        )
+
+        if uploaded_file is not None:
+            try:
+                uploaded_file.seek(0)
+                preview = pd.read_csv(uploaded_file)
+
+                st.write(
+                    f"**{dataset}:** "
+                    f"{len(preview)} rows, "
+                    f"{len(preview.columns)} columns"
+                )
+
+                st.dataframe(
+                    preview,
+                    hide_index=True,
+                    use_container_width=True,
+                )
+
+                st.info(
+                    "Preview only. This file has not been saved "
+                    "or connected to the projection model yet."
+                )
+
+            except Exception:
+                st.error(
+                    "Could not read this CSV. Check that it has "
+                    "column headings and was exported as CSV."
+                )
+
+        st.divider()
         try:
             with st.spinner("Loading available games..."):
                 events = load_events()
