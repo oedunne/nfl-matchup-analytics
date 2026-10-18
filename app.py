@@ -19,7 +19,7 @@ from urllib.request import Request, urlopen
 import pandas as pd
 import streamlit as st
 
-MODEL_VERSION = '4.0-signals-and-records'
+MODEL_VERSION = '5.0-auto-save-and-restore'
 API_BASE = 'https://api.the-odds-api.com/v4'
 SPORT = 'americanfootball_nfl'
 MARKETS = {'Passing yards': 'player_pass_yds', 'Rushing yards': 'player_rush_yds',
@@ -1247,6 +1247,169 @@ def records_dashboard():
     st.caption('MAE is mean absolute forecast error, shown only where actual stat totals exist. Compare errors within the same stat, since yards and receptions use different units. Small sample hit rates are descriptive, not proven accuracy.')
 
 
+WORKING_PATH = 'data/working_batch.json.gz'
+SAVED_PROPS_PATH = 'data/saved_props.json.gz'
+
+
+def read_working_batch():
+    raw = github(WORKING_PATH)
+    if raw is not None:
+        return json.loads(gzip.decompress(raw)), hashlib.sha256(raw).hexdigest()
+    legacy = github('data/current_batch.json')
+    if legacy:
+        old = json.loads(legacy)
+        return {'meta': {k:old['meta'][k] for k in ['season','cutoff','week']},
+                'sources':old['sources'], 'confirmed':True}, 'missing'
+    return {'meta':None,'sources':{},'confirmed':False}, 'missing'
+
+
+def save_csv_batch(meta, sources, confirmed=False):
+    existing, version = read_working_batch()
+    if existing.get('sources') and existing.get('meta') != meta:
+        raise ValueError('A different week is saved. Use Clear weekly CSVs before starting a new week.')
+    bundle = {'meta':meta, 'sources':{k:base64.b64encode(v).decode() for k,v in sources.items()},
+              'confirmed':bool(confirmed),'saved_at':utc_now().isoformat()}
+    github(WORKING_PATH, gzip.compress(json.dumps(bundle).encode(), mtime=0), expected_hash=version)
+    st.session_state.csv_dirty = False
+    st.session_state.csv_confirmed = bool(confirmed)
+
+
+def read_saved_props():
+    raw = github(SAVED_PROPS_PATH)
+    if raw is not None:
+        return pd.DataFrame(json.loads(gzip.decompress(raw))), hashlib.sha256(raw).hexdigest()
+    legacy = github('data/current_props.json')
+    return (pd.DataFrame(json.loads(legacy)) if legacy else pd.DataFrame()), 'missing'
+
+
+def merge_props(existing, incoming):
+    if incoming.empty:
+        return existing.copy()
+    old = existing.copy()
+    if not old.empty:
+        # Replace the fetched game's sportsbook snapshot; keep other games/books.
+        pairs = set(zip(incoming['Event ID'], incoming['Bookmaker']))
+        old = old[[pair not in pairs for pair in zip(old['Event ID'], old['Bookmaker'])]]
+    return pd.concat([old,incoming], ignore_index=True)
+
+
+def save_props_snapshot(incoming):
+    saved, version = read_saved_props()
+    merged = merge_props(saved, incoming)
+    github(SAVED_PROPS_PATH, gzip.compress(merged.to_json(orient='records').encode(), mtime=0), expected_hash=version)
+    st.session_state.props = merged
+    st.session_state.props_dirty = False
+    return merged
+
+
+def restore_saved_state(force=False):
+    s = st.session_state
+    bundle,_ = read_working_batch()
+    if force or not s.source_bytes:
+        sources={k:base64.b64decode(v) for k,v in bundle.get('sources',{}).items()}
+        tables={k:parse_csv(raw,k) for k,raw in sources.items()}
+        s.source_bytes,s.tables = sources,tables
+        s.batch_meta=bundle.get('meta')
+        s.csv_confirmed=bool(bundle.get('confirmed'))
+        s.projections,s.issues=pd.DataFrame(),pd.DataFrame()
+        s.model_meta=None
+        if s.batch_meta and s.csv_confirmed and REQUIRED <= tables.keys():
+            s.projections,s.issues=build_model(tables,int(s.batch_meta['cutoff']))
+            s.model_meta={**s.batch_meta,'model_version':MODEL_VERSION,'defense_weight':0.5}
+    props,_=read_saved_props()
+    if force or s.props.empty:
+        s.props=props
+    # Restoring data does not contact The Odds API or create new forecasts.
+    try:
+        load_analysis_settings()
+        s.settings_checked=True
+    except (RuntimeError,ValueError):
+        pass
+
+
+def import_games_safely(selected, force_fresh=False):
+    s=st.session_state
+    imported,reused=0,0
+    errors=[]
+    for eid in selected:
+        known=s.props[s.props['Event ID'].eq(eid) & s.props.Bookmaker.eq('DraftKings')] if not s.props.empty else pd.DataFrame()
+        if not known.empty and not force_fresh:
+            reused+=1
+            continue
+        try:
+            rows,remaining=fetch_props(eid)
+            if not rows:
+                errors.append(f'{eid}: no props returned; any saved lines were retained.')
+                continue
+            incoming=pd.DataFrame(rows)
+            # Keep fetched lines in memory even if the external save fails.
+            s.props=merge_props(s.props,incoming)
+            s.props_dirty=True
+            try:
+                save_props_snapshot(s.props)
+            except (RuntimeError,ValueError) as error:
+                errors.append('Props fetched, but automatic saving failed: '+str(error)+'. Use Save current props now before closing the page.')
+            imported+=1
+            s.last_credits_remaining=remaining
+        except RuntimeError as error:
+            errors.append(str(error))
+    return imported,reused,errors
+
+
+def clear_weekly_csvs():
+    _,version=read_working_batch()
+    github(WORKING_PATH,gzip.compress(json.dumps({'meta':None,'sources':{},'confirmed':False,'cleared_at':utc_now().isoformat()}).encode(),mtime=0),expected_hash=version)
+    s=st.session_state
+    s.tables,s.source_bytes={},{}
+    s.batch_meta,s.model_meta=None,None
+    s.projections,s.issues=pd.DataFrame(),pd.DataFrame()
+    s.csv_confirmed,s.csv_dirty=False,False
+
+
+def clear_saved_props():
+    _,version=read_saved_props()
+    github(SAVED_PROPS_PATH,gzip.compress(b'[]',mtime=0),expected_hash=version)
+    st.session_state.props=pd.DataFrame()
+    st.session_state.props_dirty=False
+
+
+def persistence_controls():
+    s=st.session_state
+    st.caption('Accepted CSVs and imported props save automatically to GitHub and restore after refresh. Stored files have no weekly expiration. Clearing current data never deletes saved picks or records.')
+    if s.get('csv_dirty'):
+        st.error('Your newest CSV changes have not saved permanently yet.')
+    if s.get('props_dirty'):
+        st.error('Your latest props are only in this session. Save them before refreshing.')
+    c1,c2=st.columns(2)
+    if c1.button('Save accepted CSVs now',disabled=not bool(s.source_bytes)):
+        try:
+            save_csv_batch(s.batch_meta,s.source_bytes,s.get('csv_confirmed',False))
+            st.success('All accepted CSVs saved.')
+        except (RuntimeError,ValueError) as e:
+            st.error(str(e))
+    if c2.button('Save current props now',disabled=s.props.empty):
+        try:
+            save_props_snapshot(s.props)
+            st.success('All imported props saved.')
+        except (RuntimeError,ValueError) as e:
+            st.error(str(e))
+    with st.expander('Start a new week / clear current data'):
+        clear_confirm=st.checkbox('I want to clear the selected current data. My saved picks and records will stay.')
+        c1,c2=st.columns(2)
+        if c1.button('Clear weekly CSVs',disabled=not clear_confirm):
+            try:
+                clear_weekly_csvs()
+                st.rerun()
+            except (RuntimeError,ValueError) as e:
+                st.error(str(e))
+        if c2.button('Clear imported props',disabled=not clear_confirm):
+            try:
+                clear_saved_props()
+                st.rerun()
+            except (RuntimeError,ValueError) as e:
+                st.error(str(e))
+
+
 def main():
     st.set_page_config(page_title='NFL Matchup Analytics', page_icon='🏈', layout='wide')
     for key, value in {'tables': {}, 'source_bytes': {}, 'projections': pd.DataFrame(), 'issues': pd.DataFrame(),
@@ -1254,6 +1417,15 @@ def main():
         if key not in st.session_state:
             st.session_state[key] = value
     s = st.session_state
+    if not s.get('auto_restore_attempted'):
+        s.auto_restore_attempted = True
+        if secret('GITHUB_TOKEN') and secret('GITHUB_REPO'):
+            try:
+                restore_saved_state()
+            except (RuntimeError, ValueError, KeyError, OSError) as error:
+                s.restore_error = str(error)
+    if s.get('restore_error'):
+        st.warning('Saved data could not fully restore: '+s.restore_error+'. Use Reload saved data and props to retry.')
     st.markdown('''<style>
     .block-container {padding-top:2rem; max-width:1600px;}
     [data-testid="stMetric"] {background:linear-gradient(120deg,#10243b,#184e64);padding:18px;border-radius:14px;border-bottom:3px solid #34d399;color:#f1f5f9;}
@@ -1281,11 +1453,12 @@ def main():
                     st.warning('Could not load saved thresholds: ' + str(error))
                 s.settings_checked = True
             settings_ui()
+            persistence_controls()
             st.subheader('Weekly data batch')
             c1, c2, c3 = st.columns(3)
-            season = c1.number_input('Season', 2020, 2100, 2026)
-            cutoff = c2.number_input('Stats through week', 1, 18, 5)
-            week = c3.number_input('Project week', 1, 22, 6)
+            season = c1.number_input('Season', 2020, 2100, int((s.batch_meta or {}).get('season',2026)))
+            cutoff = c2.number_input('Stats through week', 1, 18, int((s.batch_meta or {}).get('cutoff',5)))
+            week = c3.number_input('Project week', 1, 22, int((s.batch_meta or {}).get('week',6)))
             label = st.selectbox('CSV category', list(DATASETS))
             kind = DATASETS[label]
             uploads = st.file_uploader('Upload CSVs (one or several)', type=['csv'], accept_multiple_files=True)
@@ -1319,17 +1492,22 @@ def main():
                     st.error(f'{f.name}: {e}')
             if pending and st.button('Accept previewed files into this batch', type='primary'):
                 meta = {'season': int(season), 'cutoff': int(cutoff), 'week': int(week)}
-                if s.batch_meta is not None and s.batch_meta != meta:
-                    s.tables, s.source_bytes = {}, {}
-                for k, (raw, table) in pending.items():
-                    s.tables[k], s.source_bytes[k] = table, raw
-                s.batch_meta = meta
-                s.projections = pd.DataFrame()
-                s.model_meta = None
-                st.success('Accepted. Files remain in this session until you publish the batch.')
+                try:
+                    if s.source_bytes and s.batch_meta != meta:
+                        raise ValueError('Clear weekly CSVs explicitly before starting a different week.')
+                    for k, (raw, table) in pending.items():
+                        s.tables[k], s.source_bytes[k] = table, raw
+                    s.batch_meta = meta
+                    s.projections,s.issues = pd.DataFrame(),pd.DataFrame()
+                    s.model_meta = None
+                    s.csv_dirty,s.csv_confirmed = True,False
+                    save_csv_batch(meta,s.source_bytes,confirmed=False)
+                    st.success('Accepted and saved permanently. These CSVs will restore after refreshing.')
+                except (RuntimeError,ValueError) as error:
+                    st.error(str(error))
             st.write(f'**Accepted datasets:** {len(s.tables)} / {len(DATASETS)}')
             st.write(', '.join(sorted(s.tables)) or 'None yet')
-            confirmed = st.checkbox('All accepted files share the displayed season and cutoff; opponents are for the projection week.')
+            confirmed = st.checkbox('All accepted files share the displayed season and cutoff; opponents are for the projection week.',value=s.get('csv_confirmed',False))
             if st.button('Validate and calculate projections', disabled=not bool(s.tables)):
                 try:
                     meta = {'season': int(season), 'cutoff': int(cutoff), 'week': int(week)}
@@ -1341,7 +1519,9 @@ def main():
                                     'calculated_at': datetime.now(timezone.utc).isoformat()}
                     st.success(f'Calculated {len(p)} projections. Review Data checks before publishing.')
                     s.register_slate = True
-                except (ValueError, KeyError) as e:
+                    s.csv_dirty = True
+                    save_csv_batch(meta,s.source_bytes,confirmed=True)
+                except (RuntimeError,ValueError, KeyError) as e:
                     st.error(str(e))
             if st.button('Publish this data batch and projections to GitHub', disabled=s.model_meta is None):
                 try:
@@ -1358,53 +1538,30 @@ def main():
                 games = events()
                 event_map = {e['id']: e for e in games}
                 selected = st.multiselect('Choose games', list(event_map), format_func=lambda k: f"{event_map[k]['away_team']} at {event_map[k]['home_team']}")
-                st.caption('Four markets per game. Identical requests cached for one hour; new requests use API credits. Only click when you want to import.')
+                force_fresh = st.checkbox('Fetch fresh lines for games already saved (may use credits)',value=False)
+                st.caption('Saved game props are reused by default, even after a refresh. Only unsaved games call The Odds API unless you choose fresh lines. Every successful fetch saves automatically.')
                 if st.button('Import selected games', disabled=not selected):
-                    rows, failures = [], []
-                    for eid in selected:
-                        try:
-                            items, remaining = fetch_props(eid)
-                            rows.extend(items)
-                            st.caption(f'Credits remaining when fetched: {remaining}')
-                        except RuntimeError as e:
-                            failures.append(str(e))
-                    if rows:
-                        incoming = pd.DataFrame(rows)
-                        old = s.props
-                        if not old.empty:
-                            old = old[~old['Event ID'].isin(incoming['Event ID'])]
-                        s.props = pd.concat([old, incoming], ignore_index=True)
-                        st.success(f'Imported {len(rows)} over/under outcomes.')
-                        s.register_slate = True
-                    else:
-                        st.warning('No props returned. Existing imports retained.')
-                    for error in failures:
+                    imported,reused,errors=import_games_safely(selected,force_fresh)
+                    st.success(f'{imported} games fetched; {reused} games reused from saved lines.')
+                    if imported or reused:
+                        s.register_slate=True
+                    if s.get('last_credits_remaining') is not None:
+                        st.caption('Credits remaining when last fetched: '+str(s.last_credits_remaining))
+                    for error in errors:
                         st.error(error)
-                if st.button('Publish imported props', disabled=s.props.empty):
-                    github('data/current_props.json', s.props.to_json(orient='records').encode())
-                    st.success('Props saved permanently.')
+                if not s.props.empty:
+                    games_saved=s.props[['Event ID','Matchup','Fetched']].drop_duplicates('Event ID',keep='last')
+                    st.dataframe(games_saved[['Matchup','Fetched']],hide_index=True,use_container_width=True)
             except RuntimeError as e:
                 st.error(str(e))
 
     with weekly:
-        if st.button('Load latest published data and props'):
+        if st.button('Reload saved data and props (no Odds API credits)'):
             try:
-                load_analysis_settings()
-                raw = github('data/current_batch.json')
-                if raw:
-                    bundle = json.loads(raw)
-                    sources = {k: base64.b64decode(v) for k, v in bundle['sources'].items()}
-                    s.tables = {k: parse_csv(v, k) for k, v in sources.items()}
-                    s.source_bytes, s.batch_meta = sources, {k: bundle['meta'][k] for k in ['season', 'cutoff', 'week']}
-                    s.projections, s.issues = build_model(s.tables, int(bundle['meta']['cutoff']))
-                    s.model_meta = {**bundle['meta'], 'model_version': MODEL_VERSION, 'defense_weight': 0.5}
-                    s.register_slate = True
-                else:
-                    st.info('No published batch found.')
-                raw_props = github('data/current_props.json')
-                if raw_props:
-                    s.props = pd.DataFrame(json.loads(raw_props))
-            except (RuntimeError, ValueError, KeyError) as e:
+                restore_saved_state(force=True)
+                s.restore_error = None
+                st.success('Saved CSVs and props restored without calling The Odds API.')
+            except (RuntimeError,ValueError,KeyError,OSError) as e:
                 st.error(str(e))
         if s.model_meta:
             st.write(f"**{s.model_meta['season']} · Week {s.model_meta['week']} · Stats through Week {s.model_meta['cutoff']}**")
@@ -1482,7 +1639,9 @@ def main():
                                 new_rows = pd.DataFrame([{**common, 'Side': 'Over', 'Odds': over_odds}, {**common, 'Side': 'Under', 'Odds': under_odds}])
                                 s.props = pd.concat([s.props, new_rows], ignore_index=True)
                                 s.props = s.props.drop_duplicates(['Event ID', 'Player', 'Stat', 'Line', 'Side', 'Bookmaker'], keep='last')
-                                st.success('Manual line added. Use Publish imported props in Admin to save it for visitors.')
+                                s.props_dirty=True
+                                save_props_snapshot(s.props)
+                                st.success('Manual line added and saved permanently.')
                 except RuntimeError as e:
                     st.error(str(e))
         d = prop_comparisons(s.projections, s.props)
@@ -1533,6 +1692,7 @@ def main():
 - **QB rushing:** season rushing yards/game × QB-specific defensive rushing multiplier.
 - **Matchup rating:** compare the final forecast with the same smoothed model under the player's own scheme mix and a neutral defense. Score = 5.5 + 4.5 × tanh(log(forecast/neutral)/0.35). Neutral is 5.5; 10 is the strongest end and 1 the weakest end of this heuristic scale. It measures production matchup, not player ability or the probability of beating a line. Undefined neutral baselines show no score.
 - **Separate ratings:** defense compares the final forecast to its pre-defense forecast; coverage/scheme compares the pre-defense forecast with its neutral baseline. All use the same 1–10 transformation. Signals are Mixed when ratings lie on opposite sides of the neutral band 5.2–5.8. Missing scheme data shows — and Defense only.
+- **Persistence:** accepted CSVs save immediately, validation saves their confirmation, and each successful prop fetch saves before the next game is requested. Saved inputs/props auto-restore on a new session. Imports reuse stored games unless fresh lines are explicitly requested. An empty saved batch is a clear marker and never resurrects older published CSVs. Existing picks and records are not cleared with weekly data.
 - **No-pick ranges:** defaults ±10 passing yards, ±5 receiving/rushing yards, ±0.5 receptions, inclusive at the boundary. Admin can save different ranges. These affect new registrations and current display, not already saved forecasts or personal choices. Each official pick retains its threshold.
 - **All Model / Top 20:** official forecasts are saved once per player/event/stat, using the first registered DraftKings line. Crossed-off forecasts retain an audit trail but do not count in that record. Exclusion/restore locks at kickoff. All Model exclusions also disqualify Top 20; Top 20-only exclusions do not change All Model. Top 20 ranks absolute differences across stats (different units), selects one prop per player, and blocks that player for the day when crossed off. Started slots freeze. Historical started selections are preserved even if older versions allowed several props per player. Fewer than 20 is shown when there are not enough eligible forecasts. Days use America/Los_Angeles.
 - **Automatic results:** one-click nflverse weekly-stat import plus separate ESPN completed-game confirmation; exact name/team/opponent/season/week matching. Missing players are not automatically zero; DNPs and voids require review. Later stat corrections may update grades with history. Manual grades are respected. No scheduled background job is installed.
