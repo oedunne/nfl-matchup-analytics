@@ -6,10 +6,12 @@ import io
 import json
 import math
 import html
+import gzip
 import re
 import unicodedata
 import uuid
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -17,7 +19,7 @@ from urllib.request import Request, urlopen
 import pandas as pd
 import streamlit as st
 
-MODEL_VERSION = '2.0-approved-formulas'
+MODEL_VERSION = '3.0-records-and-results'
 API_BASE = 'https://api.the-odds-api.com/v4'
 SPORT = 'americanfootball_nfl'
 MARKETS = {'Passing yards': 'player_pass_yds', 'Rushing yards': 'player_rush_yds',
@@ -508,7 +510,7 @@ def styled_table(d, key=None):
     if 'Over / Under' in d:
         style = style.map(direction_color, subset=['Over / Under'])
     if 'Result' in d:
-        colors = {'Won': '#166534', 'Lost': '#be123c', 'Pending': '#a16207', 'Push': '#475569', 'Void': '#475569'}
+        colors = {'Won': '#166534', 'Lost': '#be123c', 'Pending': '#a16207', 'Push': '#475569', 'Void': '#475569', 'Needs review': '#a16207'}
         style = style.map(lambda v: f'color: {colors.get(v,"inherit")}; font-weight:700', subset=['Result'])
     config = {}
     if 'Matchup / 10' in d:
@@ -546,7 +548,9 @@ def select_pick_ui(projections, props):
                       'Projection When Picked': float(row.Projection), 'Odds': odds, 'Bookmaker': row.Bookmaker,
                       'Event ID': row['Event ID'], 'Kickoff (UTC)': row['Kickoff (UTC)'],
                       'Saved At': datetime.now(timezone.utc).isoformat(), 'Result': 'Pending',
-                      'Actual': None, 'Model Version': MODEL_VERSION, 'Result History': []}
+                      'Actual': None, 'Model Version': MODEL_VERSION, 'Result History': [],
+                      'Season': st.session_state.model_meta['season'], 'Week': st.session_state.model_meta['week'],
+                      'Day': local_day(row['Kickoff (UTC)']), 'Manual Grade': False}
             picks.append(record)
             github('data/my_picks.json', json.dumps(picks, allow_nan=False).encode(), expected_hash=hashlib.sha256(data).hexdigest() if data else 'missing')
             st.session_state.my_picks = picks
@@ -563,7 +567,7 @@ def result_from_actual(side, line, actual):
 
 def picks_page():
     st.subheader('Your picks. Your record.')
-    st.caption('Saved lines and projections stay frozen. Result updates are manual; no automatic grading or payout tracking.')
+    st.caption('Saved lines and projections stay frozen. Use All Model Picks to import results for all three records, or grade a personal pick manually.')
     if st.button('Load / refresh saved picks'):
         try:
             raw = github('data/my_picks.json')
@@ -576,7 +580,7 @@ def picks_page():
     picks = st.session_state.my_picks
     won = sum(p['Result'] == 'Won' for p in picks)
     lost = sum(p['Result'] == 'Lost' for p in picks)
-    pending = sum(p['Result'] == 'Pending' for p in picks)
+    pending = sum(p['Result'] in {'Pending', 'Needs review'} for p in picks)
     pushed = sum(p['Result'] == 'Push' for p in picks)
     void = sum(p['Result'] == 'Void' for p in picks)
     cols = st.columns(5)
@@ -585,12 +589,12 @@ def picks_page():
     cols[2].metric('PENDING', pending)
     cols[3].metric('PUSHES', pushed)
     cols[4].metric('VOID', void)
-    st.caption('Hit rate = wins ÷ (wins + losses). Pushes, voids, and pending picks are excluded. Record is self-reported.')
+    st.caption('Hit rate = wins ÷ (wins + losses). Pushes, voids, and pending picks are excluded. Automatic and manually reviewed grades; no payout tracking.')
     if not picks:
         st.info('Save a prop from Prop Comparisons, or load your previously saved picks.')
         return
     d = pd.DataFrame(picks)
-    status = st.selectbox('Show results', ['All', 'Pending', 'Won', 'Lost', 'Push', 'Void'])
+    status = st.selectbox('Show results', ['All', 'Pending', 'Needs review', 'Won', 'Lost', 'Push', 'Void'])
     visible = d if status == 'All' else d[d.Result == status]
     columns = ['Player', 'Team', 'Opponent', 'Stat', 'Bookmaker', 'Line', 'Your Pick', 'Projection When Picked', 'Result', 'Actual', 'Saved At']
     styled_table(visible[columns])
@@ -621,12 +625,460 @@ def picks_page():
                     if found is None:
                         raise ValueError('Pick not found; refresh the list.')
                     found.setdefault('Result History', []).append({'previous_result': found['Result'], 'previous_actual': found.get('Actual'), 'new_result': grade, 'new_actual': actual, 'at': datetime.now(timezone.utc).isoformat()})
-                    found['Result'], found['Actual'] = grade, actual
+                    found['Result'], found['Actual'] = grade, (None if grade in {'Pending', 'Void'} else actual)
+                    found['Manual Grade'] = grade != 'Pending'
                     github('data/my_picks.json', json.dumps(latest, allow_nan=False).encode(), expected_hash=hashlib.sha256(raw).hexdigest())
                     st.session_state.my_picks = latest
                     st.rerun()
                 except (RuntimeError, ValueError) as e:
                     st.error(str(e))
+
+
+TRACKER_PATH = 'data/model_tracker.json.gz'
+LOCAL_ZONE = ZoneInfo('America/Los_Angeles')
+STAT_FIELDS = {'Passing yards': 'passing_yards', 'Rushing yards': 'rushing_yards', 'Receiving yards': 'receiving_yards', 'Receptions': 'receptions'}
+
+
+def utc_now():
+    return datetime.now(timezone.utc)
+
+
+def local_day(kickoff):
+    value = pd.to_datetime(kickoff, utc=True, errors='coerce')
+    return None if pd.isna(value) else value.tz_convert(LOCAL_ZONE).date().isoformat()
+
+
+def started(pick, now=None):
+    value = pd.to_datetime(pick.get('Kickoff (UTC)'), utc=True, errors='coerce')
+    return pd.isna(value) or value <= pd.Timestamp(now or utc_now())
+
+
+def empty_tracker():
+    return {'schema': 1, 'picks': {}, 'days': {}, 'updated_at': None}
+
+
+def load_tracker():
+    raw = github(TRACKER_PATH)
+    data = json.loads(gzip.decompress(raw)) if raw else empty_tracker()
+    if not isinstance(data.get('picks'), dict) or not isinstance(data.get('days'), dict):
+        raise ValueError('Unexpected saved tracker format.')
+    return data, hashlib.sha256(raw).hexdigest() if raw else 'missing'
+
+
+def save_tracker(data, original_hash):
+    data['updated_at'] = utc_now().isoformat()
+    github(TRACKER_PATH, gzip.compress(json.dumps(data, allow_nan=False).encode(), mtime=0), expected_hash=original_hash)
+    st.session_state.model_tracker = data
+
+
+def sync_top20(data, day, now=None):
+    now = now or utc_now()
+    entry = data['days'].setdefault(day, {'active': [], 'excluded': {}, 'changes': []})
+    picks = data['picks']
+    # Once a selected game begins its place is frozen, even after it finishes.
+    locked = [pid for pid in entry['active'] if pid in picks and started(picks[pid], now)]
+    eligible = [p for pid, p in picks.items() if p.get('Day') == day and not p.get('Excluded')
+                and pid not in entry['excluded'] and not started(p, now)]
+    eligible.sort(key=lambda p: (-abs(p['Projection When Picked'] - p['Line']), p['Player'], p['Stat'], p['ID']))
+    selected = locked + [p['ID'] for p in eligible[:max(0, 20-len(locked))]]
+    if selected != entry['active']:
+        entry['changes'].append({'at': now.isoformat(), 'previous': entry['active'][:], 'new': selected[:]})
+        entry['active'] = selected
+    return entry
+
+
+def register_model_slate(projections, props, meta, now=None):
+    now = now or utc_now()
+    candidates = prop_comparisons(projections, props)
+    if candidates.empty:
+        raise ValueError('No matching upcoming props. Calculate projections and import games first.')
+    candidates = candidates[candidates.Bookmaker.str.casefold() == 'draftkings']
+    candidates = candidates.sort_values(['Fetched', 'Updated (UTC)'], ascending=False).drop_duplicates(['Event ID', 'Key', 'Stat'])
+    data, version = load_tracker()
+    added = 0
+    for _, r in candidates.iterrows():
+        difference = float(r.Projection - r.Line)
+        if difference == 0 or started(r.to_dict(), now):
+            continue
+        pid = hashlib.sha256(json.dumps([r['Event ID'], r.Key, r.Stat, 'DraftKings']).encode()).hexdigest()[:24]
+        if pid in data['picks']:
+            continue
+        side = 'Over' if difference > 0 else 'Under'
+        odds_rows = props[(props['Event ID'] == r['Event ID']) & (props.Player.map(player_key) == r.Key)
+                          & (props.Stat == r.Stat) & (props.Line == r.Line) & (props.Side == side)]
+        odds = None if odds_rows.empty or pd.isna(odds_rows.iloc[0].Odds) else float(odds_rows.iloc[0].Odds)
+        data['picks'][pid] = {
+            'ID': pid, 'Player': r.Player, 'Key': r.Key, 'Position': r.Position, 'Team': r.Team,
+            'Opponent': r.Opponent, 'Away': r.Away, 'Home': r.Home, 'Game': r.Matchup,
+            'Stat': r.Stat, 'Line': float(r.Line), 'Your Pick': side,
+            'Projection When Picked': float(r.Projection), 'Season Average': float(r['Season Average']),
+            'Odds': odds, 'Bookmaker': 'DraftKings', 'Event ID': r['Event ID'], 'Kickoff (UTC)': r['Kickoff (UTC)'],
+            'Day': local_day(r['Kickoff (UTC)']), 'Season': int(meta['season']), 'Week': int(meta['week']),
+            'Model Version': MODEL_VERSION, 'Saved At': now.isoformat(), 'Result': 'Pending', 'Actual': None,
+            'Excluded': False, 'Exclusion Reason': '', 'Exclusion History': [], 'Result History': [],
+            'Result Note': '', 'Manual Grade': False}
+        added += 1
+    for day in sorted({p['Day'] for p in data['picks'].values() if p.get('Day')}):
+        sync_top20(data, day, now)
+    save_tracker(data, version)
+    return added
+
+
+def exclude_model_pick(pid, reason, top_day=None, restore=False, now=None):
+    now = now or utc_now()
+    data, version = load_tracker()
+    p = data['picks'].get(pid)
+    if p is None:
+        raise ValueError('Pick not found. Refresh the tracker.')
+    if started(p, now):
+        raise ValueError('Exclusions and restores lock at kickoff.')
+    if not restore and not reason.strip():
+        raise ValueError('Choose an exclusion reason.')
+    if top_day is None:
+        p['Excluded'] = not restore
+        p['Exclusion Reason'] = '' if restore else reason
+        p['Exclusion History'].append({'at': now.isoformat(), 'excluded': not restore, 'reason': reason})
+    else:
+        day = data['days'].setdefault(top_day, {'active': [], 'excluded': {}, 'changes': []})
+        if restore:
+            day['excluded'].pop(pid, None)
+        else:
+            day['excluded'][pid] = {'reason': reason, 'at': now.isoformat()}
+        day['changes'].append({'at': now.isoformat(), 'pick': pid, 'excluded': not restore, 'reason': reason})
+    sync_top20(data, p['Day'], now)
+    save_tracker(data, version)
+
+
+def record_metrics(picks, key_prefix):
+    counts = {status: sum(p.get('Result') == status for p in picks) for status in ['Won', 'Lost', 'Push', 'Void', 'Pending', 'Needs review']}
+    won, lost = counts['Won'], counts['Lost']
+    cols = st.columns(5)
+    cols[0].metric('RECORD', f'{won} – {lost}')
+    cols[1].metric('HIT RATE', f'{100*won/(won+lost):.1f}%' if won+lost else '—')
+    cols[2].metric('PENDING / REVIEW', counts['Pending'] + counts['Needs review'])
+    cols[3].metric('PUSHES', counts['Push'])
+    cols[4].metric('VOID', counts['Void'])
+    st.caption(f'{len(picks)} counted selections · Hit rate excludes pending, review, pushes, voids, and crossed-off picks.')
+
+
+def pick_display(picks):
+    return pd.DataFrame([{'Game': p.get('Game', f"{p['Team']} vs {p['Opponent']}"), 'Player': p['Player'],
+                          'Stat': p['Stat'], 'Pick': p['Your Pick'], 'Line': p['Line'],
+                          'Projection': p['Projection When Picked'], 'Difference': round(abs(p['Projection When Picked']-p['Line']), 2),
+                          'Result': p['Result'], 'Actual': p.get('Actual'), 'Note': p.get('Result Note', '')} for p in picks])
+
+
+def tracker_controls():
+    st.subheader('Save forecasts and update results')
+    c1, c2 = st.columns(2)
+    if c1.button('Load / refresh model records'):
+        try:
+            data, _ = load_tracker()
+            st.session_state.model_tracker = data
+        except (ValueError, RuntimeError) as e:
+            st.error(str(e))
+    if is_admin() and c2.button('Save current model slate + refresh Top 20'):
+        try:
+            if not st.session_state.model_meta:
+                raise ValueError('Calculate or load a model batch first.')
+            added = register_model_slate(st.session_state.projections, st.session_state.props, st.session_state.model_meta)
+            st.success(f'{added} new forecasts saved. Existing saved lines remain fixed.')
+        except (ValueError, RuntimeError) as e:
+            st.error(str(e))
+
+
+def model_records_page():
+    st.subheader('All Model Picks')
+    st.caption('One official forecast per player, game, and stat. Only imported DraftKings markets with matching projections are registered. Exclusions do not change My Picks.')
+    tracker_controls()
+    if 'model_tracker' not in st.session_state:
+        st.info('Load saved records, or save the current model slate to start tracking.')
+        return
+    data = st.session_state.model_tracker
+    days = sorted({p['Day'] for p in data['picks'].values()}, reverse=True)
+    day = st.selectbox('Model record date', ['All dates'] + days)
+    picks = [p for p in data['picks'].values() if day == 'All dates' or p['Day'] == day]
+    active = [p for p in picks if not p.get('Excluded')]
+    record_metrics(active, 'model')
+    styled_table(pick_display(active))
+    if active:
+        st.download_button('Download all model picks', pd.DataFrame(active).drop(columns=['Result History', 'Exclusion History'], errors='ignore').to_csv(index=False), 'all_model_picks.csv', 'text/csv')
+    if is_admin():
+        with st.expander('Cross off picks for this week', expanded=True):
+            st.caption('✕ removes the pick from the model record and Top 20 eligibility. No deletion of the saved forecast. Locked after kickoff.')
+            candidates = [p for p in active if not started(p)]
+            reason = st.selectbox('Reason', ['Injury / availability', 'Role uncertainty', 'Line too low / too volatile', 'Data concern', 'Other'], key='model_exclude_reason')
+            search = st.text_input('Find a pick to cross off', key='model_exclude_search')
+            if search:
+                candidates = [p for p in candidates if search.casefold() in (p['Player']+' '+p['Game']+' '+p['Stat']).casefold()]
+            max_page = max(1, math.ceil(len(candidates)/20))
+            if st.session_state.get('model_exclude_page', 1) > max_page:
+                st.session_state.model_exclude_page = max_page
+            page = st.number_input('Page (20 picks per page)', min_value=1, max_value=max_page, value=1, key='model_exclude_page')
+            for p in candidates[(page-1)*20:page*20]:
+                c1, c2 = st.columns([12, 1])
+                c1.write(f"**{p['Player']}** · {p['Your Pick']} {p['Line']:g} {p['Stat']} · {p['Game']}")
+                if c2.button('✕', key='model_x_'+p['ID'], help='Exclude from model record and Top 20'):
+                    try:
+                        exclude_model_pick(p['ID'], reason)
+                        st.rerun()
+                    except (ValueError, RuntimeError) as e:
+                        st.error(str(e))
+            if not candidates:
+                st.info('No matching pregame picks to exclude.')
+        with st.expander('Excluded picks / restore before kickoff'):
+            excluded = [p for p in picks if p.get('Excluded')]
+            for p in excluded:
+                c1, c2 = st.columns([10, 2])
+                c1.write(f"{p['Player']} · {p['Stat']} · {p['Exclusion Reason']}")
+                if c2.button('Restore', key='model_restore_'+p['ID'], disabled=started(p)):
+                    try:
+                        exclude_model_pick(p['ID'], '', restore=True)
+                        st.rerun()
+                    except (ValueError, RuntimeError) as e:
+                        st.error(str(e))
+        results_update_ui()
+
+
+def best20_page():
+    st.subheader('🏆 20 Best Picks of the Day')
+    st.caption('Ranks saved forecasts by absolute projection-minus-line difference. Raw yards and receptions have different units; this follows your requested ranking, not a calibrated betting-edge score.')
+    if 'model_tracker' not in st.session_state:
+        st.info('Load or save the model slate in All Model Picks first.')
+        return
+    data = st.session_state.model_tracker
+    today = utc_now().astimezone(LOCAL_ZONE).date().isoformat()
+    days = sorted(set(data['days']) | {today})
+    day = st.selectbox('Top 20 day (California time)', days, index=days.index(today))
+    entry = data['days'].get(day, {'active': [], 'excluded': {}})
+    active = [data['picks'][pid] for pid in entry['active'] if pid in data['picks'] and not data['picks'][pid].get('Excluded') and pid not in entry['excluded']]
+    all_top = []
+    for saved_day in data['days'].values():
+        all_top.extend(data['picks'][pid] for pid in saved_day['active'] if pid in data['picks'] and not data['picks'][pid].get('Excluded') and pid not in saved_day['excluded'])
+    overall = list({p['ID']: p for p in all_top}.values())
+    st.markdown('**Top 20 · Overall record**')
+    record_metrics(overall, 'top20_overall')
+    with st.expander('Record for the selected day'):
+        record_metrics(active, 'top20_day')
+    if len(active) < 20:
+        st.info(f'{len(active)} eligible selections saved for this day. The list fills to 20 only when enough matching pregame picks are available.')
+    if is_admin():
+        if st.button('Refresh Top 20 from saved slate'):
+            try:
+                fresh, version = load_tracker()
+                sync_top20(fresh, day)
+                save_tracker(fresh, version)
+                st.rerun()
+            except (ValueError, RuntimeError) as e:
+                st.error(str(e))
+        reason = st.selectbox('Reason when crossing off a Top 20 pick', ['Injury / availability', 'Role uncertainty', 'Line too low / too volatile', 'Data concern', 'Other'], key='top_exclusion_reason')
+    else:
+        reason = ''
+    ranks = {p['ID']: n+1 for n, p in enumerate(sorted(active, key=lambda p: -abs(p['Projection When Picked']-p['Line'])))}
+    games = {}
+    for p in active:
+        games.setdefault(p['Game'], []).append(p)
+    for game, group in sorted(games.items(), key=lambda pair: min(ranks[p['ID']] for p in pair[1])):
+        st.markdown('#### ' + html.escape(game))
+        for p in sorted(group, key=lambda p:ranks[p['ID']]):
+            with st.container(border=True):
+                c1,c2,c3,c4 = st.columns([6,2,2,1])
+                c1.markdown(f"**#{ranks[p['ID']]} · {html.escape(p['Player'])}**  \n{p['Your Pick']} {p['Stat']} **{p['Line']:g}**")
+                c2.metric('Projection', f"{p['Projection When Picked']:.1f}")
+                c3.metric('Difference', f"{abs(p['Projection When Picked']-p['Line']):.1f}")
+                c1.caption('Result: ' + p['Result'])
+                if is_admin() and c4.button('✕', key='top_x_'+p['ID'], disabled=started(p), help='Exclude from Top 20 only; replace with next eligible pick'):
+                    try:
+                        exclude_model_pick(p['ID'], reason, top_day=day)
+                        st.rerun()
+                    except (ValueError, RuntimeError) as e:
+                        st.error(str(e))
+    if active:
+        st.download_button('Download this Top 20', pick_display(active).to_csv(index=False), f'top20_{day}.csv', 'text/csv')
+    with st.expander('Top 20 exclusions / restore'):
+        for pid, details in entry['excluded'].items():
+            p = data['picks'].get(pid)
+            if not p:
+                continue
+            st.write(f"{p['Player']} · {p['Stat']} · {details['reason']}")
+            if is_admin() and st.button('Restore eligibility', key='top_restore_'+pid, disabled=started(p)):
+                try:
+                    exclude_model_pick(pid, '', top_day=day, restore=True)
+                    st.rerun()
+                except (ValueError, RuntimeError) as e:
+                    st.error(str(e))
+    st.caption('Started selections keep their slots. We never replace a completed losing pick with another pick. Top 20 exclusions leave All Model Picks unchanged.')
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def download_csv(url):
+    try:
+        with urlopen(Request(url, headers={'User-Agent': 'NFL-Matchup-Analytics'}), timeout=45) as response:
+            return pd.read_csv(io.BytesIO(response.read()), low_memory=False)
+    except (HTTPError, URLError, OSError, ValueError):
+        raise RuntimeError('Could not load public results data. The season may not be available yet. Use the CSV fallback or try later.') from None
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def completed_games(day):
+    # Confirm final status separately; do not grade partial weekly statistics.
+    url = 'https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard?' + urlencode({'dates': day.replace('-', ''), 'limit': 100})
+    data, _ = request_json(url)
+    finals = set()
+    for event in data.get('events', []):
+        if not event.get('status', {}).get('type', {}).get('completed'):
+            continue
+        for comp in event.get('competitions', []):
+            teams = {x.get('homeAway'): team_code(x.get('team', {}).get('abbreviation')) for x in comp.get('competitors', [])}
+            date = local_day(event.get('date'))
+            if teams.get('home') and teams.get('away') and date:
+                finals.add((date, teams['away'], teams['home']))
+    return finals
+
+
+def normalize_weekly_stats(table, season, week):
+    t = table.copy()
+    # Accommodate current and earlier nflverse field names without guessing data.
+    rename = {}
+    for new, choices in {'Player': ['player_display_name', 'player_name', 'display_name'],
+                         'Team': ['team', 'recent_team', 'team_abbr'], 'Opponent': ['opponent_team', 'opponent']}.items():
+        found = next((c for c in choices if c in t), None)
+        if found is None:
+            raise ValueError(f'Weekly results file has no recognized {new} column.')
+        rename[found] = new
+    t = t.rename(columns=rename)
+    if not {'season','week'} <= set(t):
+        raise ValueError('Weekly results require season and week fields.')
+    t = t[(number(t.season)==int(season)) & (number(t.week)==int(week))].copy()
+    if 'season_type' in t:
+        t = t[t.season_type.astype(str).str.upper().isin(['REG', 'REGULAR'])]
+    t['Team'], t['Opponent'] = t.Team.map(team_code), t.Opponent.map(team_code)
+    t['Key'] = t.Player.map(player_key)
+    for stat in STAT_FIELDS.values():
+        if stat in t:
+            t[stat] = number(t[stat])
+    return t
+
+
+def find_actual(pick, stats):
+    key = pick.get('Key') or player_key(pick['Player'])
+    found = stats[(stats.Key == key) & (stats.Team == pick['Team']) & (stats.Opponent == pick['Opponent'])]
+    if len(found) != 1:
+        return None, 'Player missing/ambiguous in weekly stats; check participation and name. No automatic zero.'
+    field = STAT_FIELDS.get(pick['Stat'])
+    if field not in found or pd.isna(found.iloc[0][field]):
+        return None, 'Stat unavailable; not treated as zero.'
+    row = found.iloc[0]
+    actual = float(row[field])
+    opportunities = [pd.to_numeric(row.get(c), errors='coerce') for c in ['attempts', 'carries', 'targets']]
+    if actual == 0 and not any(pd.notna(v) and v > 0 for v in opportunities):
+        return None, 'Zero stat with no recorded offensive opportunity; verify participation / void rules.'
+    return actual, ''
+
+
+def apply_auto_results(picks, stats, finals, now=None):
+    now = now or utc_now()
+    changed, graded = 0, 0
+    for p in picks:
+        if p.get('Manual Grade') or p.get('Result') == 'Void':
+            continue
+        if not started(p, now):
+            continue
+        day = p.get('Day') or local_day(p['Kickoff (UTC)'])
+        # Personal picks may not store home/away. Match either orientation.
+        final = (day, p.get('Away', p['Team']), p.get('Home', p['Opponent'])) in finals or (day, p['Opponent'], p['Team']) in finals or (day, p['Team'], p['Opponent']) in finals
+        if not final:
+            p['Result Note'] = 'Waiting for confirmed final game status.'
+            continue
+        actual, note = find_actual(p, stats)
+        if actual is None:
+            if p.get('Actual') is None:
+                p['Result'] = 'Needs review'
+            p['Result Note'] = note
+            continue
+        result = result_from_actual(p['Your Pick'], p['Line'], actual)
+        if p.get('Actual') != actual or p.get('Result') != result:
+            p.setdefault('Result History', []).append({'at': now.isoformat(), 'previous_result': p.get('Result'), 'previous_actual': p.get('Actual'), 'new_result': result, 'new_actual': actual, 'source': 'nflverse weekly stats; final confirmed separately'})
+            p['Actual'], p['Result'] = actual, result
+            changed += 1
+        p['Result Note'] = 'Auto-graded; later stat corrections may update this result.'
+        p['Graded At'] = now.isoformat()
+        graded += 1
+    return changed, graded
+
+
+def result_update(season, week, uploaded_stats=None):
+    stats_raw = uploaded_stats if uploaded_stats is not None else download_csv(f'https://github.com/nflverse/nflverse-data/releases/download/stats_player/stats_player_week_{int(season)}.csv')
+    stats = normalize_weekly_stats(stats_raw, season, week)
+    if stats.empty:
+        raise ValueError('No player results found for this season/week yet. Records were not graded.')
+    data, version = load_tracker()
+    model = [p for p in data['picks'].values() if p['Season']==int(season) and p['Week']==int(week)]
+    raw_personal = github('data/my_picks.json')
+    personal = json.loads(raw_personal) if raw_personal else []
+    # New personal picks carry season/week. Older picks require exact game date matching below.
+    model_events = {p['Event ID'] for p in model}
+    selected_personal = [p for p in personal if (p.get('Season')==int(season) and p.get('Week')==int(week)) or p['Event ID'] in model_events]
+    days = sorted({p.get('Day') or local_day(p['Kickoff (UTC)']) for p in model + selected_personal})
+    finals = set()
+    for day in days:
+        if day:
+            finals |= completed_games(day)
+    c1,n1 = apply_auto_results(model, stats, finals)
+    c2,n2 = apply_auto_results(selected_personal, stats, finals)
+    save_tracker(data, version)
+    if raw_personal is not None:
+        github('data/my_picks.json', json.dumps(personal, allow_nan=False).encode(), expected_hash=hashlib.sha256(raw_personal).hexdigest())
+        st.session_state.my_picks = personal
+    return c1+c2,n1,n2
+
+
+def results_update_ui():
+    with st.expander('Update completed-game results', expanded=True):
+        st.caption('One import grades All Model Picks, Top 20, and My Picks using frozen lines. Requires both weekly player stats and confirmed final game status. Not live grading.')
+        c1,c2=st.columns(2)
+        season=c1.number_input('Result season',2020,2100,2026,key='result_season')
+        week=c2.number_input('Result week',1,18,6,key='result_week')
+        if st.button('Import results and grade all three records',type='primary'):
+            try:
+                with st.spinner('Loading weekly stats and checking final games...'):
+                    changed,n1,n2=result_update(season,week)
+                st.success(f'{n1} model and {n2} personal selections matched. {changed} result changes saved. Top 20 uses the same model results. Refresh My Picks if needed.')
+            except (RuntimeError,ValueError,KeyError) as e:
+                st.error(str(e))
+        fallback=st.file_uploader('Fallback: nflverse-format weekly results CSV',type='csv',key='weekly_actual_csv')
+        if fallback and st.button('Grade from uploaded weekly CSV'):
+            try:
+                changed,n1,n2=result_update(season,week,pd.read_csv(fallback))
+                st.success(f'Graded {n1} model and {n2} personal selections; {changed} result changes saved.')
+            except (RuntimeError,ValueError,KeyError) as e:
+                st.error(str(e))
+        st.caption('If final-status lookup is unavailable, automatic grading stops; use manual review below. DNPs/voids require review. Excluded selections retain results internally but do not count in their excluded record.')
+    with st.expander('Manual result correction / void'):
+        data=st.session_state.get('model_tracker',empty_tracker())
+        ids=list(data['picks'])
+        if not ids:
+            return
+        pid=st.selectbox('Model pick to grade',ids,format_func=lambda k:f"{data['picks'][k]['Player']} · {data['picks'][k]['Stat']} · {data['picks'][k]['Your Pick']} {data['picks'][k]['Line']}")
+        grade=st.selectbox('Manual model result',['Won','Lost','Push','Void','Pending'])
+        confirmation=st.checkbox('I verified the completed game or void condition.',key='manual_model_confirm')
+        if st.button('Save manual model result'):
+            try:
+                fresh,version=load_tracker()
+                p=fresh['picks'][pid]
+                if not confirmation:
+                    raise ValueError('Confirm the result before saving.')
+                if grade in {'Won','Lost','Push'} and not started(p):
+                    raise ValueError('This game has not started.')
+                p.setdefault('Result History',[]).append({'at':utc_now().isoformat(),'previous_result':p['Result'],'new_result':grade,'source':'manual'})
+                p['Result']=grade
+                p['Manual Grade']=grade!='Pending'
+                p['Actual']=None
+                p['Result Note']='Manually reviewed' if grade!='Pending' else 'Automatic grading re-enabled'
+                save_tracker(fresh,version)
+                st.rerun()
+            except (RuntimeError,ValueError,KeyError) as e:
+                st.error(str(e))
 
 
 def main():
@@ -645,8 +1097,8 @@ def main():
     </style>''', unsafe_allow_html=True)
     st.title('🏈 NFL Matchup Analytics')
     st.caption('Player strengths × defensive matchups · Your projections, your picks, your record')
-    weekly, comparisons, picks_tab, results, methodology, admin = st.tabs([
-        'Projections & Matchups', 'Prop Comparisons', 'My Picks', 'Model Results', 'Methodology', 'Admin / Update Data'])
+    weekly, comparisons, all_model_tab, picks_tab, best_tab, methodology, admin = st.tabs([
+        'Projections & Matchups', 'Prop Comparisons', 'All Model Picks', 'My Picks', '20 Best Picks of the Day', 'Methodology', 'Admin / Update Data'])
 
     with admin:
         st.text_input('Admin password', type='password', key='admin_password')
@@ -715,6 +1167,7 @@ def main():
                     s.model_meta = {**meta, 'model_version': MODEL_VERSION, 'defense_weight': 0.5,
                                     'calculated_at': datetime.now(timezone.utc).isoformat()}
                     st.success(f'Calculated {len(p)} projections. Review Data checks before publishing.')
+                    s.register_slate = True
                 except (ValueError, KeyError) as e:
                     st.error(str(e))
             if st.button('Publish this data batch and projections to GitHub', disabled=s.model_meta is None):
@@ -749,6 +1202,7 @@ def main():
                             old = old[~old['Event ID'].isin(incoming['Event ID'])]
                         s.props = pd.concat([old, incoming], ignore_index=True)
                         st.success(f'Imported {len(rows)} over/under outcomes.')
+                        s.register_slate = True
                     else:
                         st.warning('No props returned. Existing imports retained.')
                     for error in failures:
@@ -770,6 +1224,7 @@ def main():
                     s.source_bytes, s.batch_meta = sources, {k: bundle['meta'][k] for k in ['season', 'cutoff', 'week']}
                     s.projections, s.issues = build_model(s.tables, int(bundle['meta']['cutoff']))
                     s.model_meta = {**bundle['meta'], 'model_version': MODEL_VERSION, 'defense_weight': 0.5}
+                    s.register_slate = True
                 else:
                     st.info('No published batch found.')
                 raw_props = github('data/current_props.json')
@@ -811,6 +1266,15 @@ def main():
             if 'defensive_run_splits' in s.tables:
                 st.dataframe(s.tables['defensive_run_splits'], hide_index=True)
             st.caption('Defensive scheme yards/game feeds the approved median-based adjustments. These values reflect both volume and efficiency.')
+
+    if s.get('register_slate') and is_admin() and s.model_meta and not s.props.empty and not s.projections.empty:
+        try:
+            count = register_model_slate(s.projections, s.props, s.model_meta)
+            st.success(f'Model record saved: {count} new picks. Daily Top 20 lists refreshed.')
+        except (RuntimeError, ValueError) as error:
+            st.warning('Model record not saved yet: ' + str(error) + ' Use Save current model slate in All Model Picks to retry.')
+        finally:
+            s.register_slate = False
 
     with comparisons:
         if is_admin():
@@ -872,73 +1336,13 @@ def main():
                 st.caption('Fetch times: ' + ', '.join(sorted(s.props.Fetched.unique())))
                 st.dataframe(s.props[['Player', 'Matchup', 'Stat', 'Side', 'Line', 'Odds']], hide_index=True)
         select_pick_ui(s.projections, s.props)
-        if is_admin() and not d.empty and s.model_meta:
-            if st.button('Save pregame prediction snapshot'):
-                try:
-                    # Recheck kickoff at the moment of saving.
-                    future = d[pd.to_datetime(d['Kickoff (UTC)'], utc=True) > pd.Timestamp.now(tz='UTC')]
-                    if future.empty:
-                        raise RuntimeError('No pregame comparisons remain.')
-                    now = datetime.now(timezone.utc)
-                    path = f"data/history/{s.model_meta['season']}_w{s.model_meta['week']}_{now.strftime('%Y%m%dT%H%M%S')}_{uuid.uuid4().hex[:8]}.json"
-                    snapshot = {'meta': s.model_meta, 'saved_at': now.isoformat(),
-                                'source_hashes': {k: hashlib.sha256(v).hexdigest() for k, v in s.source_bytes.items()},
-                                'comparisons': json.loads(future.to_json(orient='records'))}
-                    github(path, json.dumps(snapshot, allow_nan=False).encode(), create_only=True)
-                    st.success('Saved immutable pregame snapshot: ' + path)
-                except RuntimeError as e:
-                    st.error(str(e))
-
     with picks_tab:
         picks_page()
 
-    with results:
-        st.write('Load a saved snapshot, then optionally upload actual results to evaluate it.')
-        path = st.text_input('Snapshot path from GitHub', placeholder='data/history/2026_w6_....json')
-        if st.button('Load snapshot'):
-            try:
-                if not re.fullmatch(r'data/history/[A-Za-z0-9_-]+\.json', path):
-                    raise ValueError('Use the data/history/...json path returned when saving.')
-                raw = github(path)
-                if raw is None:
-                    raise ValueError('Snapshot not found.')
-                s.loaded_snapshot = json.loads(raw)
-            except (RuntimeError, ValueError) as e:
-                st.error(str(e))
-        if 'loaded_snapshot' in s:
-            snapshot = s.loaded_snapshot
-            st.caption('Saved at ' + snapshot['saved_at'])
-            history = pd.DataFrame(snapshot['comparisons'])
-            history = history.drop_duplicates(['Event ID', 'Key', 'Stat', 'Line', 'Bookmaker'])
-            st.dataframe(history[['Player', 'Matchup', 'Stat', 'Projection', 'Line']], hide_index=True)
-            st.caption('Actual-results CSV columns: Event ID, Player, Stat, Actual. Actual must be the completed-game total. Evaluation below is a preview.')
-            actual_file = st.file_uploader('Actual results CSV', type='csv', key='actual_results')
-            if actual_file:
-                try:
-                    actual = pd.read_csv(actual_file)
-                    if not {'Event ID', 'Player', 'Stat', 'Actual'} <= set(actual):
-                        raise ValueError('Use the four required columns shown above.')
-                    actual['Key'] = actual.Player.map(player_key)
-                    actual['Actual'] = number(actual.Actual)
-                    if actual.Actual.isna().any() or actual.duplicated(['Event ID', 'Key', 'Stat']).any():
-                        raise ValueError('Actual results need numeric values and unique player/event/stat rows.')
-                    scored = history.merge(actual[['Event ID', 'Key', 'Stat', 'Actual']], on=['Event ID', 'Key', 'Stat'], validate='many_to_one')
-                    scored = scored[pd.to_datetime(scored['Kickoff (UTC)'], utc=True) <= pd.Timestamp.now(tz='UTC')].copy()
-                    if scored.empty:
-                        raise ValueError('No matching started games found.')
-                    scored['Absolute Error'] = (scored.Projection - scored.Actual).abs()
-                    scored['Baseline Error'] = (scored['Season Average'] - scored.Actual).abs()
-                    scored['Outcome'] = scored.apply(lambda r: 'Push' if r.Actual == r.Line else ('Correct direction' if (r.Projection - r.Line) * (r.Actual - r.Line) > 0 else ('No direction' if r.Projection == r.Line else 'Incorrect direction')), axis=1)
-                    # Forecast accuracy is one observation per event/player/stat, regardless of available lines.
-                    unique = scored.drop_duplicates(['Event ID', 'Key', 'Stat'])
-                    st.dataframe(unique.groupby('Stat').agg(Count=('Actual', 'size'), Model_MAE=('Absolute Error', 'mean'), Baseline_MAE=('Baseline Error', 'mean')).round(2))
-                    st.dataframe(scored[['Player', 'Stat', 'Projection', 'Line', 'Actual', 'Absolute Error', 'Outcome']], hide_index=True)
-                    st.download_button('Download evaluated results', scored.to_csv(index=False), 'evaluated_results.csv', 'text/csv')
-                    if is_admin() and st.button('Save evaluated results to GitHub'):
-                        github('data/results/' + uuid.uuid4().hex + '.csv', scored.to_csv(index=False).encode(), create_only=True)
-                        st.success('Results saved; original forecasts unchanged.')
-                except (ValueError, KeyError, RuntimeError) as e:
-                    st.error(str(e))
+    with all_model_tab:
+        model_records_page()
+    with best_tab:
+        best20_page()
 
     with methodology:
         st.markdown("""### Model v2 · agreed calculation rules
@@ -951,6 +1355,8 @@ def main():
 - **QB passing:** attempts/game × opponent-weighted man/zone YPA × QB passing defense multiplier. Smooth with a 20-attempt prior toward season YPA. Split attempts are estimates from passing yards/YPA; unusable estimates fall back to season YPA.
 - **QB rushing:** season rushing yards/game × QB-specific defensive rushing multiplier.
 - **Matchup rating:** compare the final forecast with the same smoothed model under the player's own scheme mix and a neutral defense. Score = 5.5 + 4.5 × tanh(log(forecast/neutral)/0.35). Neutral is 5.5; 10 is the strongest end and 1 the weakest end of this heuristic scale. It measures production matchup, not player ability or the probability of beating a line. Undefined neutral baselines show no score.
+- **All Model / Top 20:** official forecasts are saved once per player/event/stat, using the first registered DraftKings line. Crossed-off forecasts retain an audit trail but do not count in that record. Exclusion/restore locks at kickoff. All Model exclusions also disqualify Top 20; Top 20-only exclusions do not change All Model. Top 20 ranks absolute differences across stats (different units); started slots freeze. Fewer than 20 is shown when there are not enough eligible forecasts. Days use America/Los_Angeles.
+- **Automatic results:** one-click nflverse weekly-stat import plus separate ESPN completed-game confirmation; exact name/team/opponent/season/week matching. Missing players are not automatically zero; DNPs and voids require review. Later stat corrections may update grades with history. Manual grades are respected. No scheduled background job is installed.
 - **My Picks:** save your chosen side before kickoff, freezing the line, projection, odds, and timestamp. Manually mark Won/Lost/Push/Void or enter the actual completed-game stat. Record = wins/losses; hit rate excludes pushes, voids, and pending picks. Result corrections retain an audit trail. Admin password is required to write.
 - **Limits:** no injury, weather, role-change, or game-script model. Priors, 50% strengths, and rating scale are experimental settings, not fitted performance claims. Data checks flag cutoff conflicts and ambiguous names. Model Results remains available for evaluating pregame snapshots separately from your personal picks.
 """)
