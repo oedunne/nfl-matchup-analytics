@@ -19,7 +19,7 @@ from urllib.request import Request, urlopen
 import pandas as pd
 import streamlit as st
 
-MODEL_VERSION = '3.0-records-and-results'
+MODEL_VERSION = '4.0-signals-and-records'
 API_BASE = 'https://api.the-odds-api.com/v4'
 SPORT = 'americanfootball_nfl'
 MARKETS = {'Passing yards': 'player_pass_yds', 'Rushing yards': 'player_rush_yds',
@@ -213,18 +213,22 @@ def build_model(tables, cutoff, defense_weight=0.5):
         for (team, pos), group in t.groupby(['Team', 'Position']):
             selected.update(group.head(2 if pos == 'WR' else 1).Key)
 
-    def add(row, stat, projection, neutral, workload, detail, df=1.0):
+    def add(row, stat, projection, neutral, workload, detail, df=1.0, pre_defense=None, scheme_known=False):
         if not all(valid(v) for v in (projection, neutral, workload)):
             issue(row.Player, f'Invalid {stat} inputs; omitted.')
             return
         # Rating measures matchup effect, not player quality or prop value.
         rating = matchup_rating(projection, neutral)
+        pre_defense = projection / df if pre_defense is None else pre_defense
+        defense_rating = matchup_rating(projection, pre_defense)
+        scheme_rating = matchup_rating(pre_defense, neutral) if scheme_known else None
         output.append({'Player': row.Player, 'Key': row.Key, 'Position': row.Position,
                        'Team': row.Team, 'Opponent': runs.loc[row.Team, 'Opponent'], 'Stat': stat,
                        'Season Average': round(row[{'Passing yards': 'YDS', 'Rushing yards': 'YDS', 'Receiving yards': 'YDS', 'Receptions': 'REC'}[stat]] / row.GP, 4),
                        'Projection': round(projection, 4), 'Matchup Rating': rating,
                        'Neutral Projection': round(neutral, 4), 'Workload / Game': round(workload, 4),
-                       'Defense Factor': df, 'Calculation': detail})
+                       'Defense Factor': df, 'Defense Rating': defense_rating, 'Scheme Rating': scheme_rating,
+                       'Signals': signal_label(defense_rating, scheme_rating), 'Calculation': detail})
 
     for kind in ['season_passing', 'season_rushing', 'season_receiving']:
         for _, r in tables[kind].iterrows():
@@ -273,7 +277,7 @@ def build_model(tables, cutoff, defense_weight=0.5):
                     issue(player, 'Missing QB coverage split; season YPA fallback.')
                 df = defensive('QB', opp, 'Pass Yards')
                 if df is not None:
-                    add(r, 'Passing yards', attempts * expected_ypa * df, attempts * base_ypa, attempts, detail, df)
+                    add(r, 'Passing yards', attempts * expected_ypa * df, attempts * base_ypa, attempts, detail, df, scheme_known=a is not None and b is not None and weights is not None)
                 else:
                     issue(player, 'Missing valid QB defensive passing benchmark; omitted.')
             elif kind == 'season_rushing':
@@ -312,8 +316,9 @@ def build_model(tables, cutoff, defense_weight=0.5):
                 classified = min(1.0, (a.Rushes + b.Rushes) / r.ATT)
                 ypc = classified * sum(w * rate * adj for w, rate, adj in zip(expected, rates, dfs)) + (1 - classified) * overall
                 neutral_ypc = classified * sum(w * rate for w, rate in zip(own, rates)) + (1 - classified) * overall
+                pre_defense_ypc = classified * sum(w * rate for w, rate in zip(expected, rates)) + (1 - classified) * overall
                 detail = f'Carries/game; zone share {expected[0]:.1%}; gap {expected[1]:.1%}; 20-carry priors; unclassified {1-classified:.1%} neutral; no extra CBS rushing multiplier'
-                add(r, 'Rushing yards', carries * ypc, carries * neutral_ypc, carries, detail)
+                add(r, 'Rushing yards', carries * ypc, carries * neutral_ypc, carries, detail, pre_defense=carries * pre_defense_ypc, scheme_known=True)
             else:
                 if not all(valid(r[c]) for c in ['TGTS', 'REC']) or r.TGTS <= 0 or r.REC < 0 or r.REC > r.TGTS:
                     issue(player, 'Invalid receiving targets/receptions; omitted.')
@@ -321,6 +326,7 @@ def build_model(tables, cutoff, defense_weight=0.5):
                 base_targets, base_catch, base_ypt = r.TGTS / gp, r.REC / r.TGTS, r.YDS / r.TGTS
                 target_count, catches, yards = base_targets, base_targets * base_catch, base_targets * base_ypt
                 neutral_catches, neutral_yards = catches, yards
+                has_coverage = False
                 detail = 'Season targets/game × season efficiency; RB has no receiving coverage splits'
                 if pos in {'WR', 'TE'}:
                     a, b, weights = get(pos.lower() + '_man', key), get(pos.lower() + '_zone', key), mix(opp)
@@ -333,6 +339,7 @@ def build_model(tables, cutoff, defense_weight=0.5):
                         if not all(valid(v) and v >= 0 for v in routes + targets) or sum(routes) <= 0 or sum(targets) <= 0:
                             issue(player, 'Unusable split target estimates; using season receiving baseline.')
                         else:
+                            has_coverage = True
                             historical = shares(*routes)
                             base_tpr = sum(targets) / sum(routes)
                             tprs = [(t + 50 * base_tpr) / (n + 50) for t, n in zip(targets, routes)]
@@ -354,7 +361,7 @@ def build_model(tables, cutoff, defense_weight=0.5):
                     if df is None:
                         issue(player, f'Missing valid {pos} defensive {stat} benchmark; omitted.')
                     else:
-                        add(r, stat, production * df, neutral, target_count, detail, df)
+                        add(r, stat, production * df, neutral, target_count, detail, df, scheme_known=has_coverage)
     return pd.DataFrame(output), pd.DataFrame(issues, columns=['Player / Team', 'Issue']).drop_duplicates()
 
 
@@ -470,18 +477,18 @@ def prop_comparisons(projections, props):
     d = d[pd.to_datetime(d['Kickoff (UTC)'], utc=True, errors='coerce') > pd.Timestamp.now(tz='UTC')].copy()
     d['Difference'] = d['Projection'] - d['Line']
     d['Difference %'] = d['Difference'].div(d['Line'].replace(0, float('nan'))) * 100
-    d['Direction'] = d['Difference'].apply(lambda v: 'Over' if v > 0 else ('Under' if v < 0 else 'Equal'))
+    d['Direction'] = d.apply(lambda r: pick_direction(r.Stat, r.Projection, r.Line), axis=1)
     return d
 
 
 PROJECTION_COLUMNS = ['Player', 'Position', 'Team', 'Opponent', 'Stat', 'Season Average',
-                      'Our Projection', 'DraftKings O/U', 'Matchup / 10', 'Over / Under', 'By How Much']
+                      'Our Projection', 'DraftKings O/U', 'Matchup / 10', 'Defense / 10', 'Coverage / Scheme / 10', 'Signals', 'Over / Under', 'By How Much']
 
 
 def joined_projections(projections, props):
     if projections.empty:
         return pd.DataFrame(columns=PROJECTION_COLUMNS)
-    out = projections.rename(columns={'Projection': 'Our Projection', 'Matchup Rating': 'Matchup / 10'}).copy()
+    out = projections.rename(columns={'Projection': 'Our Projection', 'Matchup Rating': 'Matchup / 10', 'Defense Rating': 'Defense / 10', 'Scheme Rating': 'Coverage / Scheme / 10'}).copy()
     if 'Matchup / 10' not in out:
         out['Matchup / 10'] = None
     lines = prop_comparisons(projections, props)
@@ -494,8 +501,11 @@ def joined_projections(projections, props):
         out = out.rename(columns={'Line': 'DraftKings O/U'})
     else:
         out['DraftKings O/U'] = float('nan')
+    for column in ['Defense / 10', 'Coverage / Scheme / 10', 'Signals']:
+        if column not in out:
+            out[column] = None
     delta = out['Our Projection'] - out['DraftKings O/U']
-    out['Over / Under'] = delta.apply(lambda v: 'No line' if pd.isna(v) else ('Over' if v > 0 else ('Under' if v < 0 else 'Equal')))
+    out['Over / Under'] = out.apply(lambda r: pick_direction(r.Stat, r['Our Projection'], r['DraftKings O/U']), axis=1)
     out['By How Much'] = delta.abs()
     return out[PROJECTION_COLUMNS]
 
@@ -513,8 +523,12 @@ def styled_table(d, key=None):
         colors = {'Won': '#166534', 'Lost': '#be123c', 'Pending': '#a16207', 'Push': '#475569', 'Void': '#475569', 'Needs review': '#a16207'}
         style = style.map(lambda v: f'color: {colors.get(v,"inherit")}; font-weight:700', subset=['Result'])
     config = {}
-    if 'Matchup / 10' in d:
-        config['Matchup / 10'] = st.column_config.ProgressColumn('Matchup / 10', min_value=1, max_value=10, format='%.1f')
+    for rating_column in ['Matchup / 10', 'Defense / 10', 'Coverage / Scheme / 10']:
+        if rating_column in d:
+            config[rating_column] = st.column_config.ProgressColumn(rating_column, min_value=1, max_value=10, format='%.1f')
+    if 'Signals' in d:
+        colors = {'Mixed': '#b45309', 'Favorable': '#047857', 'Unfavorable': '#be123c', 'Neutral': '#475569'}
+        style = style.map(lambda v: 'color:'+colors.get(v, '#64748b')+';font-weight:700', subset=['Signals'])
     st.dataframe(style, hide_index=True, use_container_width=True, column_config=config, key=key)
 
 
@@ -674,13 +688,24 @@ def save_tracker(data, original_hash):
 def sync_top20(data, day, now=None):
     now = now or utc_now()
     entry = data['days'].setdefault(day, {'active': [], 'excluded': {}, 'changes': []})
+    entry.setdefault('excluded_players', {})
     picks = data['picks']
-    # Once a selected game begins its place is frozen, even after it finishes.
+    # Retain started selections to avoid rewriting historical records.
     locked = [pid for pid in entry['active'] if pid in picks and started(picks[pid], now)]
+    player = lambda p: p.get('Key') or player_key(p['Player'])
+    blocked = set(entry['excluded_players']) | {player(picks[pid]) for pid in entry['excluded'] if pid in picks}
     eligible = [p for pid, p in picks.items() if p.get('Day') == day and not p.get('Excluded')
-                and pid not in entry['excluded'] and not started(p, now)]
+                and pid not in entry['excluded'] and player(p) not in blocked and not started(p, now)
+                and pick_direction(p['Stat'], p['Projection When Picked'], p['Line']) in {'Over','Under'}]
     eligible.sort(key=lambda p: (-abs(p['Projection When Picked'] - p['Line']), p['Player'], p['Stat'], p['ID']))
-    selected = locked + [p['ID'] for p in eligible[:max(0, 20-len(locked))]]
+    selected, used = locked[:], {player(picks[pid]) for pid in locked}
+    for p in eligible:
+        if len(selected) >= 20:
+            break
+        if player(p) in used:
+            continue
+        selected.append(p['ID'])
+        used.add(player(p))
     if selected != entry['active']:
         entry['changes'].append({'at': now.isoformat(), 'previous': entry['active'][:], 'new': selected[:]})
         entry['active'] = selected
@@ -698,7 +723,7 @@ def register_model_slate(projections, props, meta, now=None):
     added = 0
     for _, r in candidates.iterrows():
         difference = float(r.Projection - r.Line)
-        if difference == 0 or started(r.to_dict(), now):
+        if pick_direction(r.Stat, r.Projection, r.Line) == 'No pick' or started(r.to_dict(), now):
             continue
         pid = hashlib.sha256(json.dumps([r['Event ID'], r.Key, r.Stat, 'DraftKings']).encode()).hexdigest()[:24]
         if pid in data['picks']:
@@ -716,7 +741,7 @@ def register_model_slate(projections, props, meta, now=None):
             'Day': local_day(r['Kickoff (UTC)']), 'Season': int(meta['season']), 'Week': int(meta['week']),
             'Model Version': MODEL_VERSION, 'Saved At': now.isoformat(), 'Result': 'Pending', 'Actual': None,
             'Excluded': False, 'Exclusion Reason': '', 'Exclusion History': [], 'Result History': [],
-            'Result Note': '', 'Manual Grade': False}
+            'Result Note': '', 'Manual Grade': False, 'No Pick Range When Saved': no_pick_settings().get(r.Stat, 0.0)}
         added += 1
     for day in sorted({p['Day'] for p in data['picks'].values() if p.get('Day')}):
         sync_top20(data, day, now)
@@ -740,9 +765,16 @@ def exclude_model_pick(pid, reason, top_day=None, restore=False, now=None):
         p['Exclusion History'].append({'at': now.isoformat(), 'excluded': not restore, 'reason': reason})
     else:
         day = data['days'].setdefault(top_day, {'active': [], 'excluded': {}, 'changes': []})
+        key = p.get('Key') or player_key(p['Player'])
+        day.setdefault('excluded_players', {})
         if restore:
-            day['excluded'].pop(pid, None)
+            day['excluded_players'].pop(key, None)
+            for old_id in list(day['excluded']):
+                old = data['picks'].get(old_id, {})
+                if (old.get('Key') or player_key(old.get('Player', ''))) == key:
+                    day['excluded'].pop(old_id, None)
         else:
+            day['excluded_players'][key] = {'reason': reason, 'at': now.isoformat()}
             day['excluded'][pid] = {'reason': reason, 'at': now.isoformat()}
         day['changes'].append({'at': now.isoformat(), 'pick': pid, 'excluded': not restore, 'reason': reason})
     sync_top20(data, p['Day'], now)
@@ -773,6 +805,7 @@ def tracker_controls():
     c1, c2 = st.columns(2)
     if c1.button('Load / refresh model records'):
         try:
+            load_analysis_settings()
             data, _ = load_tracker()
             st.session_state.model_tracker = data
         except (ValueError, RuntimeError) as e:
@@ -842,7 +875,7 @@ def model_records_page():
 
 def best20_page():
     st.subheader('🏆 20 Best Picks of the Day')
-    st.caption('Ranks saved forecasts by absolute projection-minus-line difference. Raw yards and receptions have different units; this follows your requested ranking, not a calibrated betting-edge score.')
+    st.caption('One prop per player: the largest qualifying absolute projection-minus-line difference. Crossing off a pick blocks that player for this day. Raw yards and receptions use different units; this is not a calibrated betting-edge score.')
     if 'model_tracker' not in st.session_state:
         st.info('Load or save the model slate in All Model Picks first.')
         return
@@ -887,7 +920,7 @@ def best20_page():
                 c2.metric('Projection', f"{p['Projection When Picked']:.1f}")
                 c3.metric('Difference', f"{abs(p['Projection When Picked']-p['Line']):.1f}")
                 c1.caption('Result: ' + p['Result'])
-                if is_admin() and c4.button('✕', key='top_x_'+p['ID'], disabled=started(p), help='Exclude from Top 20 only; replace with next eligible pick'):
+                if is_admin() and c4.button('✕', key='top_x_'+p['ID'], disabled=started(p), help='Exclude this player from today’s Top 20; refill with another player'):
                     try:
                         exclude_model_pick(p['ID'], reason, top_day=day)
                         st.rerun()
@@ -907,7 +940,7 @@ def best20_page():
                     st.rerun()
                 except (ValueError, RuntimeError) as e:
                     st.error(str(e))
-    st.caption('Started selections keep their slots. We never replace a completed losing pick with another pick. Top 20 exclusions leave All Model Picks unchanged.')
+    st.caption('Started selections keep their slots. Top 20 exclusions block that player for the day and leave All Model Picks unchanged. Older started selections retain their original rules.')
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -1081,6 +1114,139 @@ def results_update_ui():
                 st.error(str(e))
 
 
+DEFAULT_NO_PICK = {'Passing yards': 10.0, 'Receiving yards': 5.0, 'Rushing yards': 5.0, 'Receptions': 0.5}
+
+
+def no_pick_settings():
+    try:
+        return {**DEFAULT_NO_PICK, **st.session_state.get('no_pick_ranges', {})}
+    except Exception:
+        return DEFAULT_NO_PICK.copy()
+
+
+def pick_direction(stat, projection, line, ranges=None):
+    if pd.isna(projection) or pd.isna(line):
+        return 'No line'
+    difference = float(projection) - float(line)
+    threshold = (ranges or no_pick_settings()).get(stat, 0.0)
+    if abs(difference) <= threshold + 1e-9:
+        return 'No pick'
+    return 'Over' if difference > 0 else 'Under'
+
+
+def signal_label(defense, scheme):
+    def direction(rating):
+        if rating is None or pd.isna(rating):
+            return None
+        return 1 if rating > 5.8 else (-1 if rating < 5.2 else 0)
+    d, s = direction(defense), direction(scheme)
+    if s is None:
+        return 'Defense only' if d is not None else 'Unavailable'
+    if d is None:
+        return 'Scheme only'
+    if d*s < 0:
+        return 'Mixed'
+    if d > 0 or s > 0:
+        return 'Favorable'
+    if d < 0 or s < 0:
+        return 'Unfavorable'
+    return 'Neutral'
+
+
+def settings_ui():
+    with st.expander('Official model pick thresholds'):
+        st.caption('Rows inside or exactly on the ± range remain visible as No pick. They do not enter new official model records or Top 20. Personal picks remain your choice. Existing saved forecasts are not regraded or silently removed when settings change.')
+        current = no_pick_settings()
+        with st.form('threshold_settings'):
+            values = {}
+            columns = st.columns(2)
+            for n, (stat, default) in enumerate(DEFAULT_NO_PICK.items()):
+                values[stat] = columns[n % 2].number_input('± range: ' + stat, min_value=0.0, value=float(current[stat]), step=0.5)
+            save = st.form_submit_button('Save no-pick ranges')
+        if save:
+            try:
+                github('data/analysis_settings.json', json.dumps({'no_pick_ranges': values}).encode())
+                st.session_state.no_pick_ranges = values
+                st.success('Ranges saved. New forecasts use these ranges; previously saved records stay unchanged.')
+            except RuntimeError as e:
+                st.error(str(e))
+
+
+def load_analysis_settings():
+    raw = github('data/analysis_settings.json')
+    if raw:
+        saved = json.loads(raw).get('no_pick_ranges', {})
+        if any(k not in DEFAULT_NO_PICK or not isinstance(v, (int, float)) or not math.isfinite(v) or v < 0 for k, v in saved.items()):
+            raise ValueError('Saved no-pick ranges are invalid.')
+        st.session_state.no_pick_ranges = {**DEFAULT_NO_PICK, **saved}
+
+
+def summarize_records(picks, group):
+    if not picks:
+        return pd.DataFrame()
+    rows=[]
+    frame=pd.DataFrame(picks)
+    for label, part in frame.groupby(group, dropna=False):
+        statuses=part.Result.value_counts()
+        w,l=int(statuses.get('Won',0)),int(statuses.get('Lost',0))
+        settled=part[part.Result.isin(['Won','Lost','Push']) & pd.to_numeric(part.Actual,errors='coerce').notna()].copy()
+        if not settled.empty:
+            settled=settled.drop_duplicates(['Event ID','Key','Stat']) if 'Key' in settled else settled
+            error=(pd.to_numeric(settled['Projection When Picked'])-pd.to_numeric(settled.Actual)).abs().mean()
+            baseline=(pd.to_numeric(settled['Season Average'])-pd.to_numeric(settled.Actual)).abs().mean() if 'Season Average' in settled else float('nan')
+        else:
+            error,baseline=float('nan'),float('nan')
+        rows.append({group:label,'Picks':len(part),'Wins':w,'Losses':l,'Pushes':int(statuses.get('Push',0)),
+                     'Pending / Review':int(statuses.get('Pending',0)+statuses.get('Needs review',0)),
+                     'Void':int(statuses.get('Void',0)),'Hit Rate %':100*w/(w+l) if w+l else float('nan'),
+                     'Model MAE':error,'Season Baseline MAE':baseline})
+    return pd.DataFrame(rows)
+
+
+def records_dashboard():
+    st.subheader('📊 Records Dashboard')
+    st.caption('All three records in one place. Crossed-off picks are excluded from the relevant record. Counts include every saved qualifying pick, not just wins. No-pick rows are never official selections.')
+    if st.button('Refresh all three records', key='dashboard_refresh'):
+        try:
+            data,_=load_tracker()
+            st.session_state.model_tracker=data
+            raw=github('data/my_picks.json')
+            st.session_state.my_picks=json.loads(raw) if raw else []
+        except (RuntimeError,ValueError) as e:
+            st.error(str(e))
+    if 'model_tracker' not in st.session_state:
+        st.info('Refresh records above to load saved results.')
+        return
+    data=st.session_state.model_tracker
+    all_picks=[p for p in data['picks'].values() if not p.get('Excluded')]
+    my_picks=st.session_state.get('my_picks',[])
+    best=[]
+    for entry in data['days'].values():
+        best.extend(data['picks'][pid] for pid in entry['active'] if pid in data['picks'] and not data['picks'][pid].get('Excluded') and pid not in entry['excluded'])
+    best=list({p['ID']:p for p in best}.values())
+    days=sorted({p.get('Day') or local_day(p['Kickoff (UTC)']) for p in all_picks+my_picks+best if p.get('Kickoff (UTC)')},reverse=True)
+    chosen=st.selectbox('Dashboard date',['All dates']+days)
+    def filtered(picks):
+        return [p for p in picks if chosen=='All dates' or (p.get('Day') or local_day(p['Kickoff (UTC)']))==chosen]
+    all_picks,my_picks,best=map(filtered,(all_picks,my_picks,best))
+    for title,picks in [('All Model Picks',all_picks),('My Picks',my_picks),('Top 20',best)]:
+        st.markdown('#### '+title)
+        if title == 'My Picks' and 'my_picks' not in st.session_state:
+            st.info('Refresh all three records to load your personal record.')
+        else:
+            record_metrics(picks,'dashboard_'+title)
+    st.markdown('### All Model Picks · Breakdowns')
+    for col,title in [('Stat','By stat category'),('Position','By position'),('Your Pick','Overs vs Unders')]:
+        st.markdown('**'+title+'**')
+        report=summarize_records(all_picks,col)
+        if col != 'Stat':
+            report=report.drop(columns=['Model MAE','Season Baseline MAE'],errors='ignore')
+        styled_table(report)
+        if not report.empty:
+            st.download_button('Download '+title,report.to_csv(index=False),'record_'+col.replace(' ','_')+'.csv','text/csv',key='download_'+col)
+    st.caption('MAE is mean absolute forecast error, shown only where actual stat totals exist. Compare errors within the same stat, since yards and receptions use different units. Small sample hit rates are descriptive, not proven accuracy.')
+
+
 def main():
     st.set_page_config(page_title='NFL Matchup Analytics', page_icon='🏈', layout='wide')
     for key, value in {'tables': {}, 'source_bytes': {}, 'projections': pd.DataFrame(), 'issues': pd.DataFrame(),
@@ -1097,8 +1263,8 @@ def main():
     </style>''', unsafe_allow_html=True)
     st.title('🏈 NFL Matchup Analytics')
     st.caption('Player strengths × defensive matchups · Your projections, your picks, your record')
-    weekly, comparisons, all_model_tab, picks_tab, best_tab, methodology, admin = st.tabs([
-        'Projections & Matchups', 'Prop Comparisons', 'All Model Picks', 'My Picks', '20 Best Picks of the Day', 'Methodology', 'Admin / Update Data'])
+    weekly, comparisons, all_model_tab, picks_tab, best_tab, dashboard_tab, methodology, admin = st.tabs([
+        'Projections & Matchups', 'Prop Comparisons', 'All Model Picks', 'My Picks', '20 Best Picks of the Day', 'Records Dashboard', 'Methodology', 'Admin / Update Data'])
 
     with admin:
         st.text_input('Admin password', type='password', key='admin_password')
@@ -1108,6 +1274,13 @@ def main():
             st.error('Incorrect password.')
         if is_admin():
             st.success('Admin access enabled.')
+            if not s.get('settings_checked'):
+                try:
+                    load_analysis_settings()
+                except (RuntimeError, ValueError) as error:
+                    st.warning('Could not load saved thresholds: ' + str(error))
+                s.settings_checked = True
+            settings_ui()
             st.subheader('Weekly data batch')
             c1, c2, c3 = st.columns(3)
             season = c1.number_input('Season', 2020, 2100, 2026)
@@ -1216,6 +1389,7 @@ def main():
     with weekly:
         if st.button('Load latest published data and props'):
             try:
+                load_analysis_settings()
                 raw = github('data/current_batch.json')
                 if raw:
                     bundle = json.loads(raw)
@@ -1257,7 +1431,7 @@ def main():
             p = p.sort_values(sortcol, ascending=order in {'Worst matchup', 'Player name'}, na_position='last')
             st.caption('Up to 2 WRs and 1 QB, TE, RB per team, chosen by primary season yards/game. Props are the latest imported DraftKings lines for matching upcoming games. — means no line imported.')
             styled_table(p)
-            st.caption('Matchup rating: 5.5 is neutral; closer to 10 is more favorable for production, closer to 1 is less favorable. It is not a win probability or a rating of the prop price.')
+            st.caption('All ratings: 5.5 is neutral; higher favors production. Defense and coverage/scheme are separate effects. Mixed means they pull in opposite directions. — means unavailable. No pick means the difference is inside the configured range; the projection is still shown.')
             st.download_button('Download projection table', p.to_csv(index=False), 'projections.csv', 'text/csv')
         with st.expander('Data checks — review before using projections', expanded=not s.issues.empty):
             st.dataframe(s.issues, hide_index=True, use_container_width=True)
@@ -1344,6 +1518,9 @@ def main():
     with best_tab:
         best20_page()
 
+    with dashboard_tab:
+        records_dashboard()
+
     with methodology:
         st.markdown("""### Model v2 · agreed calculation rules
 - **Player selection:** up to two WRs and one QB, TE, RB per team, ranked by primary season yards/game. QB selection carries over to QB rushing; RB selection carries over to RB receiving. This is a production filter, not a verified depth chart.
@@ -1355,10 +1532,12 @@ def main():
 - **QB passing:** attempts/game × opponent-weighted man/zone YPA × QB passing defense multiplier. Smooth with a 20-attempt prior toward season YPA. Split attempts are estimates from passing yards/YPA; unusable estimates fall back to season YPA.
 - **QB rushing:** season rushing yards/game × QB-specific defensive rushing multiplier.
 - **Matchup rating:** compare the final forecast with the same smoothed model under the player's own scheme mix and a neutral defense. Score = 5.5 + 4.5 × tanh(log(forecast/neutral)/0.35). Neutral is 5.5; 10 is the strongest end and 1 the weakest end of this heuristic scale. It measures production matchup, not player ability or the probability of beating a line. Undefined neutral baselines show no score.
-- **All Model / Top 20:** official forecasts are saved once per player/event/stat, using the first registered DraftKings line. Crossed-off forecasts retain an audit trail but do not count in that record. Exclusion/restore locks at kickoff. All Model exclusions also disqualify Top 20; Top 20-only exclusions do not change All Model. Top 20 ranks absolute differences across stats (different units); started slots freeze. Fewer than 20 is shown when there are not enough eligible forecasts. Days use America/Los_Angeles.
+- **Separate ratings:** defense compares the final forecast to its pre-defense forecast; coverage/scheme compares the pre-defense forecast with its neutral baseline. All use the same 1–10 transformation. Signals are Mixed when ratings lie on opposite sides of the neutral band 5.2–5.8. Missing scheme data shows — and Defense only.
+- **No-pick ranges:** defaults ±10 passing yards, ±5 receiving/rushing yards, ±0.5 receptions, inclusive at the boundary. Admin can save different ranges. These affect new registrations and current display, not already saved forecasts or personal choices. Each official pick retains its threshold.
+- **All Model / Top 20:** official forecasts are saved once per player/event/stat, using the first registered DraftKings line. Crossed-off forecasts retain an audit trail but do not count in that record. Exclusion/restore locks at kickoff. All Model exclusions also disqualify Top 20; Top 20-only exclusions do not change All Model. Top 20 ranks absolute differences across stats (different units), selects one prop per player, and blocks that player for the day when crossed off. Started slots freeze. Historical started selections are preserved even if older versions allowed several props per player. Fewer than 20 is shown when there are not enough eligible forecasts. Days use America/Los_Angeles.
 - **Automatic results:** one-click nflverse weekly-stat import plus separate ESPN completed-game confirmation; exact name/team/opponent/season/week matching. Missing players are not automatically zero; DNPs and voids require review. Later stat corrections may update grades with history. Manual grades are respected. No scheduled background job is installed.
 - **My Picks:** save your chosen side before kickoff, freezing the line, projection, odds, and timestamp. Manually mark Won/Lost/Push/Void or enter the actual completed-game stat. Record = wins/losses; hit rate excludes pushes, voids, and pending picks. Result corrections retain an audit trail. Admin password is required to write.
-- **Limits:** no injury, weather, role-change, or game-script model. Priors, 50% strengths, and rating scale are experimental settings, not fitted performance claims. Data checks flag cutoff conflicts and ambiguous names. Model Results remains available for evaluating pregame snapshots separately from your personal picks.
+- **Limits:** no injury, weather, role-change, or game-script model. Priors, 50% strengths, and rating scale are experimental settings, not fitted performance claims. Data checks flag cutoff conflicts and ambiguous names. The Records Dashboard separates the three records and breaks down model results by stat, position, and side.
 """)
     st.divider()
     st.caption('NFL Matchup Analytics — Independent sports analytics project — Created by Owen Dunne')
