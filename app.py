@@ -468,6 +468,7 @@ def fetch_props(event_id):
 
 
 def prop_comparisons(projections, props):
+    projections=injury_filtered(projections)
     if projections.empty or props.empty:
         return pd.DataFrame()
     p = props.copy()
@@ -486,6 +487,7 @@ PROJECTION_COLUMNS = ['Player', 'Position', 'Team', 'Opponent', 'Stat', 'Season 
 
 
 def joined_projections(projections, props):
+    projections=injury_filtered(projections)
     if projections.empty:
         return pd.DataFrame(columns=PROJECTION_COLUMNS)
     out = projections.rename(columns={'Projection': 'Our Projection', 'Matchup Rating': 'Matchup / 10', 'Defense Rating': 'Defense / 10', 'Scheme Rating': 'Coverage / Scheme / 10'}).copy()
@@ -516,6 +518,9 @@ def styled_table(d, key=None):
         return
     def direction_color(v):
         return 'background-color: #d1fae5; color: #065f46; font-weight: 700' if v == 'Over' else ('background-color: #ffe4e6; color: #9f1239; font-weight: 700' if v == 'Under' else '')
+    d=d.copy()
+    if 'Team' in d:
+        d.insert(0,'Team badge',d.Team.map(logo_url))
     style = d.style.format(precision=1, na_rep='—')
     if 'Over / Under' in d:
         style = style.map(direction_color, subset=['Over / Under'])
@@ -523,13 +528,17 @@ def styled_table(d, key=None):
         colors = {'Won': '#166534', 'Lost': '#be123c', 'Pending': '#a16207', 'Push': '#475569', 'Void': '#475569', 'Needs review': '#a16207'}
         style = style.map(lambda v: f'color: {colors.get(v,"inherit")}; font-weight:700', subset=['Result'])
     config = {}
+    if 'Team badge' in d:
+        config['Team badge']=st.column_config.ImageColumn('',width='small')
+    for col in ['Season','Week','Picks','Wins','Losses','Pushes','Pending / Review','Void']:
+        if col in d:config[col]=st.column_config.NumberColumn(col,format='%d')
     for rating_column in ['Matchup / 10', 'Defense / 10', 'Coverage / Scheme / 10']:
         if rating_column in d:
             config[rating_column] = st.column_config.ProgressColumn(rating_column, min_value=1, max_value=10, format='%.1f')
     if 'Signals' in d:
         colors = {'Mixed': '#b45309', 'Favorable': '#047857', 'Unfavorable': '#be123c', 'Neutral': '#475569'}
         style = style.map(lambda v: 'color:'+colors.get(v, '#64748b')+';font-weight:700', subset=['Signals'])
-    st.dataframe(style, hide_index=True, use_container_width=True, column_config=config, key=key)
+    st.dataframe(style, hide_index=True, use_container_width=True, column_config=config, key=key, row_height=46)
 
 
 def select_pick_ui(projections, props):
@@ -539,15 +548,23 @@ def select_pick_ui(projections, props):
     lines = prop_comparisons(projections, props)
     if lines.empty:
         return
+    lines = game_filter_frame(lines,'my_pick_game')
+    if lines.empty:return
     lines = lines.sort_values('Fetched', ascending=False).drop_duplicates(['Event ID', 'Key', 'Stat', 'Line', 'Bookmaker', 'Side'])
     st.subheader('Add a prop to My Picks')
     candidates = lines.drop_duplicates(['Event ID', 'Key', 'Stat', 'Line', 'Bookmaker']).reset_index(drop=True)
     index = st.selectbox('Choose a prop', list(candidates.index), format_func=lambda n: f"{candidates.loc[n,'Player']} · {candidates.loc[n,'Stat']} · {candidates.loc[n,'Line']:g} · {candidates.loc[n,'Bookmaker']}")
     row = candidates.loc[index]
-    st.caption(f"Our projection: {row.Projection:.1f} · {row.Matchup} · kickoff {row['Kickoff (UTC)']}")
+    fixture_banner(row.Team,row.Opponent,'Choose your side below')
+    c1,c2,c3=st.columns(3)
+    c1.metric('Our projection',f'{row.Projection:.1f}')
+    c2.metric('Prop line',f'{row.Line:g}')
+    c3.metric('Difference',f'{row.Projection-row.Line:+.1f}')
     side = st.radio('Your prediction', ['Over', 'Under'], index=0 if row.Projection >= row.Line else 1, horizontal=True)
     if st.button('Save selected pick', type='primary'):
         try:
+            if st.session_state.get('injury_load_error'):
+                raise ValueError('Refresh injury notes successfully before saving a new pick.')
             if pd.to_datetime(row['Kickoff (UTC)'], utc=True) <= pd.Timestamp.now(tz='UTC'):
                 raise ValueError('Game has started; choose an upcoming prop.')
             match = lines[(lines['Event ID'] == row['Event ID']) & (lines.Key == row.Key) & (lines.Stat == row.Stat) & (lines.Line == row.Line) & (lines.Bookmaker == row.Bookmaker) & (lines.Side == side)]
@@ -564,7 +581,9 @@ def select_pick_ui(projections, props):
                       'Saved At': datetime.now(timezone.utc).isoformat(), 'Result': 'Pending',
                       'Actual': None, 'Model Version': MODEL_VERSION, 'Result History': [],
                       'Season': st.session_state.model_meta['season'], 'Week': st.session_state.model_meta['week'],
-                      'Day': local_day(row['Kickoff (UTC)']), 'Manual Grade': False}
+                      'Day': local_day(row['Kickoff (UTC)']), 'Manual Grade': False,
+                      'Injury Notes When Picked':matching_injury(row.Player,row.Team,st.session_state.model_meta['season'],st.session_state.model_meta['week']),
+                      'Game Injury Notes When Picked':game_injury_context(row.Team,row.Opponent,st.session_state.model_meta['season'],st.session_state.model_meta['week'])}
             picks.append(record)
             github('data/my_picks.json', json.dumps(picks, allow_nan=False).encode(), expected_hash=hashlib.sha256(data).hexdigest() if data else 'missing')
             st.session_state.my_picks = picks
@@ -580,7 +599,10 @@ def result_from_actual(side, line, actual):
 
 
 def picks_page():
-    st.subheader('Your picks. Your record.')
+    st.subheader('🎯 My Picks')
+    select_pick_ui(st.session_state.projections,st.session_state.props)
+    manual_prop_entry_ui()
+    st.divider()
     st.caption('Saved lines and projections stay frozen. Use All Model Picks to import results for all three records, or grade a personal pick manually.')
     if st.button('Load / refresh saved picks'):
         try:
@@ -591,12 +613,14 @@ def picks_page():
     if 'my_picks' not in st.session_state:
         st.info('Load your saved picks above to display your record.')
         return
-    picks = st.session_state.my_picks
-    won = sum(p['Result'] == 'Won' for p in picks)
-    lost = sum(p['Result'] == 'Lost' for p in picks)
-    pending = sum(p['Result'] in {'Pending', 'Needs review'} for p in picks)
-    pushed = sum(p['Result'] == 'Push' for p in picks)
-    void = sum(p['Result'] == 'Void' for p in picks)
+    picks = game_filter_picks(st.session_state.my_picks,'my_saved_game')
+    official=official_records(picks)
+    st.caption(record_scope_label()+'. Pilot picks remain visible in the table.')
+    won = sum(p['Result'] == 'Won' for p in official)
+    lost = sum(p['Result'] == 'Lost' for p in official)
+    pending = sum(p['Result'] in {'Pending', 'Needs review'} for p in official)
+    pushed = sum(p['Result'] == 'Push' for p in official)
+    void = sum(p['Result'] == 'Void' for p in official)
     cols = st.columns(5)
     cols[0].metric('RECORD', f'{won} – {lost}')
     cols[1].metric('HIT RATE', f'{100*won/(won+lost):.1f}%' if won+lost else '—')
@@ -605,13 +629,15 @@ def picks_page():
     cols[4].metric('VOID', void)
     st.caption('Hit rate = wins ÷ (wins + losses). Pushes, voids, and pending picks are excluded. Automatic and manually reviewed grades; no payout tracking.')
     if not picks:
-        st.info('Save a prop from Prop Comparisons, or load your previously saved picks.')
+        st.info('Choose a game and save your first prop above, or load your saved picks.')
         return
     d = pd.DataFrame(picks)
+    d['Injury Alert']=[(n['Status']+': '+n.get('Notes','')) if (n:=injury_for_pick(p)) and n['Status']!='Healthy / cleared' else '' for p in picks]
+    d['Record Scope']=['Official' if official_pick(p) else ('Pilot' if record_week(p)==(2026,6) else 'Not in cumulative') for p in picks]
     status = st.selectbox('Show results', ['All', 'Pending', 'Needs review', 'Won', 'Lost', 'Push', 'Void'])
     visible = d if status == 'All' else d[d.Result == status]
-    columns = ['Player', 'Team', 'Opponent', 'Stat', 'Bookmaker', 'Line', 'Your Pick', 'Projection When Picked', 'Result', 'Actual', 'Saved At']
-    styled_table(visible[columns])
+    columns = ['Player', 'Team', 'Opponent', 'Stat', 'Bookmaker', 'Line', 'Your Pick', 'Projection When Picked', 'Result', 'Actual', 'Injury Alert', 'Record Scope', 'Saved At']
+    styled_table(visible.reindex(columns=columns))
     st.download_button('Download my picks', d.drop(columns=['Result History'], errors='ignore').to_csv(index=False), 'my_picks.csv', 'text/csv')
     if is_admin():
         with st.expander('Grade or correct a saved pick', expanded=True):
@@ -686,34 +712,43 @@ def save_tracker(data, original_hash):
 
 
 def sync_top20(data, day, now=None):
-    now = now or utc_now()
-    entry = data['days'].setdefault(day, {'active': [], 'excluded': {}, 'changes': []})
-    entry.setdefault('excluded_players', {})
-    picks = data['picks']
-    # Retain started selections to avoid rewriting historical records.
-    locked = [pid for pid in entry['active'] if pid in picks and started(picks[pid], now)]
-    player = lambda p: p.get('Key') or player_key(p['Player'])
-    blocked = set(entry['excluded_players']) | {player(picks[pid]) for pid in entry['excluded'] if pid in picks}
-    eligible = [p for pid, p in picks.items() if p.get('Day') == day and not p.get('Excluded')
-                and pid not in entry['excluded'] and player(p) not in blocked and not started(p, now)
-                and pick_direction(p['Stat'], p['Projection When Picked'], p['Line']) in {'Over','Under'}]
-    eligible.sort(key=lambda p: (-abs(p['Projection When Picked'] - p['Line']), p['Player'], p['Stat'], p['ID']))
-    selected, used = locked[:], {player(picks[pid]) for pid in locked}
+    now=now or utc_now()
+    entry=data['days'].setdefault(day,{'active':[],'excluded':{},'changes':[]})
+    entry.setdefault('excluded_players',{})
+    picks=data['picks']
+    player=lambda p:p.get('Key') or player_key(p['Player'])
+    locked=[pid for pid in entry['active'] if pid in picks and started(picks[pid],now)]
+    blocked=set(entry['excluded_players'])|{player(picks[pid]) for pid in entry['excluded'] if pid in picks}
+    eligible=[p for pid,p in picks.items() if p.get('Day')==day and not p.get('Excluded') and not p.get('Injury Excluded')
+              and pid not in entry['excluded'] and player(p) not in blocked and not started(p,now)
+              and pick_direction(p['Stat'],p['Projection When Picked'],p['Line']) in {'Over','Under'}]
+    eligible.sort(key=lambda p:(-abs(p['Projection When Picked']-p['Line']),p['Player'],p['Stat'],p['ID']))
+    selected,used=locked[:],{player(picks[pid]) for pid in locked}
+    teams,passing={},{}
+    def cluster(p):
+        # Directional passing-production overlap, including RB receiving.
+        return (p['Team'],p['Your Pick']) if p['Stat'] in {'Passing yards','Receiving yards','Receptions'} else None
+    def count(p):
+        teams[p['Team']]=teams.get(p['Team'],0)+1
+        c=cluster(p)
+        if c:passing[c]=passing.get(c,0)+1
+    for pid in locked:count(picks[pid])
     for p in eligible:
-        if len(selected) >= 20:
-            break
-        if player(p) in used:
+        if len(selected)>=20:break
+        c=cluster(p)
+        if player(p) in used or teams.get(p['Team'],0)>=3 or (c and passing.get(c,0)>=2):
             continue
-        selected.append(p['ID'])
-        used.add(player(p))
-    if selected != entry['active']:
-        entry['changes'].append({'at': now.isoformat(), 'previous': entry['active'][:], 'new': selected[:]})
-        entry['active'] = selected
+        selected.append(p['ID']);used.add(player(p));count(p)
+    if selected!=entry['active']:
+        entry['changes'].append({'at':now.isoformat(),'previous':entry['active'][:],'new':selected[:],'selection_policy':UI_VERSION})
+        entry['active']=selected
     return entry
 
 
 def register_model_slate(projections, props, meta, now=None):
     now = now or utc_now()
+    if st.session_state.get('injury_load_error'):
+        raise ValueError('Load injury notes successfully before registering new picks.')
     candidates = prop_comparisons(projections, props)
     if candidates.empty:
         raise ValueError('No matching upcoming props. Calculate projections and import games first.')
@@ -741,7 +776,7 @@ def register_model_slate(projections, props, meta, now=None):
             'Day': local_day(r['Kickoff (UTC)']), 'Season': int(meta['season']), 'Week': int(meta['week']),
             'Model Version': MODEL_VERSION, 'Saved At': now.isoformat(), 'Result': 'Pending', 'Actual': None,
             'Excluded': False, 'Exclusion Reason': '', 'Exclusion History': [], 'Result History': [],
-            'Result Note': '', 'Manual Grade': False, 'No Pick Range When Saved': no_pick_settings().get(r.Stat, 0.0)}
+            'Result Note': '', 'Manual Grade': False, 'Injury Excluded':False, 'UI Version':UI_VERSION, 'Game Injury Notes When Picked':game_injury_context(r.Team,r.Opponent,meta['season'],meta['week']), 'Injury Notes When Picked':matching_injury(r.Player,r.Team,meta['season'],meta['week']), 'No Pick Range When Saved': no_pick_settings().get(r.Stat, 0.0)}
         added += 1
     for day in sorted({p['Day'] for p in data['picks'].values() if p.get('Day')}):
         sync_top20(data, day, now)
@@ -831,14 +866,16 @@ def model_records_page():
     days = sorted({p['Day'] for p in data['picks'].values()}, reverse=True)
     day = st.selectbox('Model record date', ['All dates'] + days)
     picks = [p for p in data['picks'].values() if day == 'All dates' or p['Day'] == day]
-    active = [p for p in picks if not p.get('Excluded')]
-    record_metrics(active, 'model')
+    picks = game_filter_picks(picks,'all_model_game')
+    active = [p for p in picks if not p.get('Excluded') and not p.get('Injury Excluded')]
+    st.caption(record_scope_label()+'. Displayed historical picks include the pilot.')
+    record_metrics(official_records(active), 'model')
     styled_table(pick_display(active))
     if active:
         st.download_button('Download all model picks', pd.DataFrame(active).drop(columns=['Result History', 'Exclusion History'], errors='ignore').to_csv(index=False), 'all_model_picks.csv', 'text/csv')
     if is_admin():
         with st.expander('Cross off picks for this week', expanded=True):
-            st.caption('✕ removes the pick from the model record and Top 20 eligibility. No deletion of the saved forecast. Locked after kickoff.')
+            st.caption('✕ removes this pick from the record and Top 20 eligibility before kickoff. Injury exclusions are managed in Injuries. No saved forecast is deleted.')
             candidates = [p for p in active if not started(p)]
             reason = st.selectbox('Reason', ['Injury / availability', 'Role uncertainty', 'Line too low / too volatile', 'Data concern', 'Other'], key='model_exclude_reason')
             search = st.text_input('Find a pick to cross off', key='model_exclude_search')
@@ -860,11 +897,11 @@ def model_records_page():
             if not candidates:
                 st.info('No matching pregame picks to exclude.')
         with st.expander('Excluded picks / restore before kickoff'):
-            excluded = [p for p in picks if p.get('Excluded')]
+            excluded = [p for p in picks if p.get('Excluded') or p.get('Injury Excluded')]
             for p in excluded:
                 c1, c2 = st.columns([10, 2])
-                c1.write(f"{p['Player']} · {p['Stat']} · {p['Exclusion Reason']}")
-                if c2.button('Restore', key='model_restore_'+p['ID'], disabled=started(p)):
+                c1.write(f"{p['Player']} · {p['Stat']} · {p.get('Exclusion Reason') or ('Injury exclusion' if p.get('Injury Excluded') else '')}")
+                if c2.button('Restore', key='model_restore_'+p['ID'], disabled=started(p) or bool(p.get('Injury Excluded'))):
                     try:
                         exclude_model_pick(p['ID'], '', restore=True)
                         st.rerun()
@@ -884,13 +921,14 @@ def best20_page():
     days = sorted(set(data['days']) | {today})
     day = st.selectbox('Top 20 day (California time)', days, index=days.index(today))
     entry = data['days'].get(day, {'active': [], 'excluded': {}})
-    active = [data['picks'][pid] for pid in entry['active'] if pid in data['picks'] and not data['picks'][pid].get('Excluded') and pid not in entry['excluded']]
+    active = [data['picks'][pid] for pid in entry['active'] if pid in data['picks'] and not data['picks'][pid].get('Excluded') and not data['picks'][pid].get('Injury Excluded') and pid not in entry['excluded']]
     all_top = []
     for saved_day in data['days'].values():
-        all_top.extend(data['picks'][pid] for pid in saved_day['active'] if pid in data['picks'] and not data['picks'][pid].get('Excluded') and pid not in saved_day['excluded'])
+        all_top.extend(data['picks'][pid] for pid in saved_day['active'] if pid in data['picks'] and not data['picks'][pid].get('Excluded') and not data['picks'][pid].get('Injury Excluded') and pid not in saved_day['excluded'])
     overall = list({p['ID']: p for p in all_top}.values())
     st.markdown('**Top 20 · Overall record**')
-    record_metrics(overall, 'top20_overall')
+    st.caption(record_scope_label())
+    record_metrics(official_records(overall), 'top20_overall')
     with st.expander('Record for the selected day'):
         record_metrics(active, 'top20_day')
     if len(active) < 20:
@@ -907,12 +945,13 @@ def best20_page():
         reason = st.selectbox('Reason when crossing off a Top 20 pick', ['Injury / availability', 'Role uncertainty', 'Line too low / too volatile', 'Data concern', 'Other'], key='top_exclusion_reason')
     else:
         reason = ''
+    st.caption('Top 20 limits: one prop per player, up to three per team, and up to two same-team passing-related picks in each direction. Historical started selections keep their original policy.')
     ranks = {p['ID']: n+1 for n, p in enumerate(sorted(active, key=lambda p: -abs(p['Projection When Picked']-p['Line'])))}
     games = {}
     for p in active:
         games.setdefault(p['Game'], []).append(p)
     for game, group in sorted(games.items(), key=lambda pair: min(ranks[p['ID']] for p in pair[1])):
-        st.markdown('#### ' + html.escape(game))
+        fixture_banner(group[0]['Team'],group[0]['Opponent'],game)
         for p in sorted(group, key=lambda p:ranks[p['ID']]):
             with st.container(border=True):
                 c1,c2,c3,c4 = st.columns([6,2,2,1])
@@ -1204,47 +1243,54 @@ def summarize_records(picks, group):
 
 
 def records_dashboard():
-    st.subheader('📊 Records Dashboard')
-    st.caption('All three records in one place. Crossed-off picks are excluded from the relevant record. Counts include every saved qualifying pick, not just wins. No-pick rows are never official selections.')
-    if st.button('Refresh all three records', key='dashboard_refresh'):
+    st.subheader('📊 Records hub')
+    st.caption('Official cumulative totals start in 2026 Week 7. Week 6 remains a visible pilot baseline. Excluded picks do not count; forecasts and past results are never deleted.')
+    if st.button('Refresh all three records',key='dashboard_refresh'):
         try:
-            data,_=load_tracker()
-            st.session_state.model_tracker=data
-            raw=github('data/my_picks.json')
-            st.session_state.my_picks=json.loads(raw) if raw else []
-        except (RuntimeError,ValueError) as e:
-            st.error(str(e))
+            load_record_policy()
+            data,_=load_tracker();st.session_state.model_tracker=data
+            raw=github('data/my_picks.json');st.session_state.my_picks=json.loads(raw) if raw else []
+        except (RuntimeError,ValueError) as error:
+            st.error(str(error))
     if 'model_tracker' not in st.session_state:
         st.info('Refresh records above to load saved results.')
         return
     data=st.session_state.model_tracker
-    all_picks=[p for p in data['picks'].values() if not p.get('Excluded')]
-    my_picks=st.session_state.get('my_picks',[])
-    best=[]
+    model=[p for p in data['picks'].values() if not p.get('Excluded') and not p.get('Injury Excluded')]
+    mine=st.session_state.get('my_picks',[])
+    top=[]
     for entry in data['days'].values():
-        best.extend(data['picks'][pid] for pid in entry['active'] if pid in data['picks'] and not data['picks'][pid].get('Excluded') and pid not in entry['excluded'])
-    best=list({p['ID']:p for p in best}.values())
-    days=sorted({p.get('Day') or local_day(p['Kickoff (UTC)']) for p in all_picks+my_picks+best if p.get('Kickoff (UTC)')},reverse=True)
-    chosen=st.selectbox('Dashboard date',['All dates']+days)
-    def filtered(picks):
-        return [p for p in picks if chosen=='All dates' or (p.get('Day') or local_day(p['Kickoff (UTC)']))==chosen]
-    all_picks,my_picks,best=map(filtered,(all_picks,my_picks,best))
-    for title,picks in [('All Model Picks',all_picks),('My Picks',my_picks),('Top 20',best)]:
+        top.extend(data['picks'][pid] for pid in entry['active'] if pid in data['picks'] and not data['picks'][pid].get('Excluded') and not data['picks'][pid].get('Injury Excluded') and pid not in entry['excluded'])
+    top=list({p['ID']:p for p in top}.values())
+    groups=[('All Model Picks',model),('My Picks',mine),('Top 20',top)]
+    st.markdown('### Official cumulative records')
+    st.caption(record_scope_label())
+    for title,picks in groups:
         st.markdown('#### '+title)
-        if title == 'My Picks' and 'my_picks' not in st.session_state:
-            st.info('Refresh all three records to load your personal record.')
+        if title=='My Picks' and 'my_picks' not in st.session_state:
+            st.info('Refresh records to load personal picks.')
         else:
-            record_metrics(picks,'dashboard_'+title)
-    st.markdown('### All Model Picks · Breakdowns')
+            record_metrics(official_records(picks),'official_'+title)
+    st.markdown('### Week-by-week history')
+    weekly=weekly_records_table(groups)
+    if not weekly.empty:
+        weeks=sorted(set(zip(weekly.Season,weekly.Week)))
+        selected=st.selectbox('History week',['All weeks']+weeks,format_func=lambda w:w if w=='All weeks' else f'{w[0]} · Week {w[1]}'+(' · Pilot' if w==(2026,6) else ''))
+        visible=weekly if selected=='All weeks' else weekly[(weekly.Season==selected[0])&(weekly.Week==selected[1])]
+        styled_table(visible)
+        st.download_button('Download weekly history',weekly.to_csv(index=False),'weekly_records.csv','text/csv')
+    else:
+        st.info('Weekly history appears after picks are saved.')
+    st.markdown('### Model record breakdowns')
+    scope=st.selectbox('Breakdown scope',['Official cumulative','Week 6 pilot','All saved weeks'])
+    rows=official_records(model) if scope=='Official cumulative' else ([p for p in model if record_week(p)==(2026,6)] if scope=='Week 6 pilot' else model)
     for col,title in [('Stat','By stat category'),('Position','By position'),('Your Pick','Overs vs Unders')]:
         st.markdown('**'+title+'**')
-        report=summarize_records(all_picks,col)
-        if col != 'Stat':
-            report=report.drop(columns=['Model MAE','Season Baseline MAE'],errors='ignore')
+        report=summarize_records(rows,col)
+        if col!='Stat':report=report.drop(columns=['Model MAE','Season Baseline MAE'],errors='ignore')
         styled_table(report)
-        if not report.empty:
-            st.download_button('Download '+title,report.to_csv(index=False),'record_'+col.replace(' ','_')+'.csv','text/csv',key='download_'+col)
-    st.caption('MAE is mean absolute forecast error, shown only where actual stat totals exist. Compare errors within the same stat, since yards and receptions use different units. Small sample hit rates are descriptive, not proven accuracy.')
+    st.caption('MAE compares stat-total forecast errors only within a stat category. Pilot results remain available for analysis without affecting official totals.')
+
 
 
 WORKING_PATH = 'data/working_batch.json.gz'
@@ -1320,6 +1366,13 @@ def restore_saved_state(force=False):
     if force or s.props.empty:
         s.props=props
     # Restoring data does not contact The Odds API or create new forecasts.
+    load_record_policy()
+    try:
+        load_injuries()
+        s.injury_load_error=None
+    except (RuntimeError,ValueError) as error:
+        s.injury_load_error=str(error)
+        raise
     try:
         load_analysis_settings()
         s.settings_checked=True
@@ -1410,6 +1463,379 @@ def persistence_controls():
                 st.error(str(e))
 
 
+UI_VERSION = '6.0-week7-interface'
+RECORD_POLICY_PATH = 'data/record_policy.json'
+INJURIES_PATH = 'data/injury_notes.json'
+DEFAULT_RECORD_POLICY = {'official_start': {'season':2026,'week':7}, 'pilot_weeks':['2026:6']}
+TEAM_COLORS = {'ARI':'#97233f','ATL':'#a71930','BAL':'#6336a8','BUF':'#1769d2','CAR':'#0085ca','CHI':'#d55e18',
+               'CIN':'#fb4f14','CLE':'#c85b18','DAL':'#3277b3','DEN':'#fb4f14','DET':'#0076b6','GB':'#19866a',
+               'HOU':'#c32945','IND':'#3467bf','JAX':'#007f87','KC':'#df2747','LAC':'#0080c6','LAR':'#3869db',
+               'LV':'#626d7c','MIA':'#008e97','MIN':'#7650b2','NE':'#c62b49','NO':'#a88d54','NYG':'#3467ba',
+               'NYJ':'#147d64','PHI':'#118577','PIT':'#b78a00','SEA':'#4d8f31','SF':'#b53137','TB':'#d52c32',
+               'TEN':'#3487bd','WAS':'#9b3144'}
+
+
+def logo_url(team):
+    code={'WAS':'wsh'}.get(team,str(team).lower())
+    return f'https://a.espncdn.com/i/teamlogos/nfl/500/{code}.png'
+
+
+def fixture_key(team,opponent):
+    return ' / '.join(sorted([str(team),str(opponent)]))
+
+
+def fixture_title(key):
+    return ' vs '.join(TEAM_NAMES.get(t,t).split()[-1] for t in key.split(' / '))
+
+
+def fixture_banner(team,opponent,caption=''):
+    a,b=html.escape(str(team)),html.escape(str(opponent))
+    title=html.escape(TEAM_NAMES.get(team,a)+' vs '+TEAM_NAMES.get(opponent,b))
+    color=TEAM_COLORS.get(team,'#087f70')
+    st.markdown(f'''<div class="fixture-banner" style="border-left:5px solid {color}">
+    <img src="{logo_url(team)}" alt="{a}"/><div><div class="fixture-title">{title}</div>
+    <div class="fixture-caption">{html.escape(caption)}</div></div><img src="{logo_url(opponent)}" alt="{b}"/></div>''',unsafe_allow_html=True)
+
+
+def game_filter_frame(frame,key,banner=True):
+    if frame.empty or not {'Team','Opponent'}<=set(frame):
+        return frame
+    options=sorted({fixture_key(t,o) for t,o in zip(frame.Team,frame.Opponent)})
+    chosen=st.selectbox('Game',['All games']+options,format_func=lambda x:x if x=='All games' else fixture_title(x),key=key)
+    if chosen=='All games':
+        return frame
+    selected=frame[[fixture_key(t,o)==chosen for t,o in zip(frame.Team,frame.Opponent)]]
+    if banner and not selected.empty:
+        r=selected.iloc[0]
+        fixture_banner(r.Team,r.Opponent)
+    return selected
+
+
+def game_filter_picks(picks,key):
+    if not picks:
+        return picks
+    frame=game_filter_frame(pd.DataFrame(picks),key)
+    ids=set(frame.ID)
+    return [p for p in picks if p['ID'] in ids]
+
+
+def load_record_policy():
+    raw=github(RECORD_POLICY_PATH)
+    policy=json.loads(raw) if raw else json.loads(json.dumps(DEFAULT_RECORD_POLICY))
+    if not isinstance(policy.get('official_start'),dict) or not {'season','week'}<=set(policy['official_start']):
+        raise ValueError('Saved record policy is invalid.')
+    st.session_state.record_policy=policy
+    return policy
+
+
+def record_week(pick):
+    try:
+        return int(pick['Season']),int(pick['Week'])
+    except (KeyError,TypeError,ValueError):
+        return None
+
+
+def official_pick(pick,policy=None):
+    policy=policy or st.session_state.get('record_policy',DEFAULT_RECORD_POLICY)
+    week=record_week(pick)
+    if week is None:
+        return False
+    start=policy['official_start']
+    return week>=(int(start['season']),int(start['week'])) and f'{week[0]}:{week[1]}' not in policy.get('pilot_weeks',[])
+
+
+def official_records(picks):
+    return [p for p in picks if official_pick(p)]
+
+
+def record_scope_label():
+    p=st.session_state.get('record_policy',DEFAULT_RECORD_POLICY)['official_start']
+    return f"Official cumulative record · {p['season']} Week {p['week']} onward"
+
+
+def record_policy_ui():
+    with st.expander('Pilot week and official cumulative records'):
+        policy=st.session_state.get('record_policy',DEFAULT_RECORD_POLICY)
+        st.write('**Week 6 (2026) is the pilot. It remains in weekly history and is excluded from official cumulative totals.**')
+        st.caption(record_scope_label()+'. Picks without season/week metadata stay in history but need review before they can count officially.')
+        with st.form('record_policy_form'):
+            c1,c2=st.columns(2)
+            season=c1.number_input('Official record start season',2026,2100,int(policy['official_start']['season']))
+            week=c2.number_input('Official record start week',1,22,int(policy['official_start']['week']))
+            save=st.form_submit_button('Save official record starting week')
+        if save:
+            try:
+                target=(int(season),int(week));old=(int(policy['official_start']['season']),int(policy['official_start']['week']))
+                if target!=old:
+                    data,_=load_tracker()
+                    personal_raw=github('data/my_picks.json')
+                    all_rows=list(data['picks'].values())+(json.loads(personal_raw) if personal_raw else [])
+                    for p in all_rows:
+                        w=record_week(p)
+                        if w and w>=(2026,7) and started(p) and ((w>=target)!=(w>=old)):
+                            raise ValueError('This would change whether started official-week picks count. Choose record rules before games begin.')
+                changed={**policy,'official_start':{'season':int(season),'week':int(week)}}
+                github(RECORD_POLICY_PATH,json.dumps(changed).encode())
+                st.session_state.record_policy=changed
+                st.success('Record policy saved. No forecasts or results were deleted.')
+            except (RuntimeError,ValueError) as error:
+                st.error(str(error))
+
+
+def load_injuries():
+    raw=github(INJURIES_PATH)
+    data=json.loads(raw) if raw else {'entries':{},'history':[]}
+    if not isinstance(data.get('entries'),dict):
+        raise ValueError('Saved injury notes are invalid.')
+    st.session_state.injury_data=data
+    st.session_state.injury_load_error=None
+    return data,hashlib.sha256(raw).hexdigest() if raw else 'missing'
+
+
+def matching_injury(player,team,season,week):
+    entries=st.session_state.get('injury_data',{}).get('entries',{})
+    key=player_key(player)
+    return next((r for r in entries.values() if r['Key']==key and r['Team']==team and r['Season']==int(season) and r['Week']==int(week)),None)
+
+
+def game_injury_context(team,opponent,season,week):
+    return [dict(note) for note in st.session_state.get('injury_data',{}).get('entries',{}).values()
+            if note['Team'] in {team,opponent} and note['Season']==int(season) and note['Week']==int(week)]
+
+
+def injury_blocks(player,team,meta=None):
+    meta=meta or st.session_state.get('model_meta') or st.session_state.get('batch_meta')
+    if not meta:
+        return False
+    note=matching_injury(player,team,meta['season'],meta['week'])
+    return bool(note and note.get('Exclude Props'))
+
+
+def injury_filtered(projections,meta=None):
+    if projections.empty:
+        return projections
+    return projections[[not injury_blocks(r.Player,r.Team,meta) for _,r in projections.iterrows()]].copy()
+
+
+def injury_for_pick(pick):
+    w=record_week(pick)
+    return matching_injury(pick['Player'],pick['Team'],*w) if w else None
+
+
+def sync_injury_exclusions():
+    # A saved pick keeps its original line/projection; only pregame eligibility changes.
+    data,version=load_tracker()
+    changed=False
+    for p in data['picks'].values():
+        if started(p):
+            continue
+        note=injury_for_pick(p)
+        block=bool(note and note.get('Exclude Props'))
+        current=bool(p.get('Injury Excluded'))
+        if block!=current:
+            p['Injury Excluded']=block
+            p.setdefault('Exclusion History',[]).append({'at':utc_now().isoformat(),'source':'injury','excluded':block,'status':note.get('Status') if note else 'cleared'})
+            changed=True
+    if changed:
+        for day in list(data['days']):
+            sync_top20(data,day)
+        save_tracker(data,version)
+    else:
+        st.session_state.model_tracker=data
+
+
+def save_injury(entry):
+    entry=dict(entry)
+    if entry['Status']=='Out':entry['Exclude Props']=True
+    data,version=load_injuries()
+    identifier=hashlib.sha256(json.dumps([entry['Season'],entry['Week'],entry['Team'],entry['Key']]).encode()).hexdigest()[:24]
+    previous=data['entries'].get(identifier)
+    entry={**entry,'ID':identifier,'Updated At':utc_now().isoformat()}
+    data['history'].append({'at':utc_now().isoformat(),'previous':previous,'new':entry})
+    data['entries'][identifier]=entry
+    github(INJURIES_PATH,json.dumps(data).encode(),expected_hash=version)
+    st.session_state.injury_data=data
+    try:
+        sync_injury_exclusions()
+        st.session_state.injury_sync_error=None
+    except (RuntimeError,ValueError) as error:
+        st.session_state.injury_sync_error='Note saved, but model-record exclusions still need syncing: '+str(error)
+
+
+def injuries_page():
+    st.subheader('🩺 Weekly injury room')
+    st.caption('Enter key offensive or defensive injuries by game. This release handles notes and prop eligibility only—no touches are redistributed and projection formulas do not change.')
+    s=st.session_state
+    if st.button('Load / refresh injury notes'):
+        try:
+            load_injuries()
+        except (RuntimeError,ValueError) as error:
+            st.error(str(error))
+    meta=s.model_meta or s.batch_meta or {'season':2026,'week':7}
+    c1,c2=st.columns(2)
+    season=c1.number_input('Injury season',2026,2100,int(meta['season']),key='injury_season')
+    week=c2.number_input('Injury week',1,22,int(meta['week']),key='injury_week')
+    fixtures=set()
+    if not s.props.empty:
+        upcoming=s.props[pd.to_datetime(s.props['Kickoff (UTC)'],utc=True,errors='coerce')>pd.Timestamp.now(tz='UTC')]
+        fixtures.update(fixture_key(a,b) for a,b in zip(upcoming.Away,upcoming.Home))
+    if int(season)==int(meta['season']) and int(week)==int(meta['week']) and 'defensive_run_splits' in s.tables:
+        fixtures.update(fixture_key(r.Team,r.Opponent) for _,r in s.tables['defensive_run_splits'].iterrows() if pd.notna(r.Opponent))
+    chosen=st.selectbox('Injury game',['Choose teams manually']+sorted(fixtures),format_func=lambda v: fixture_title(v) if v!='Choose teams manually' else v)
+    if chosen=='Choose teams manually':
+        c1,c2=st.columns(2)
+        a=c1.selectbox('First team',list(TEAM_NAMES),format_func=lambda t:TEAM_NAMES[t],key='injury_team_a')
+        b=c2.selectbox('Opponent team',[t for t in TEAM_NAMES if t!=a],format_func=lambda t:TEAM_NAMES[t],key='injury_team_b')
+    else:
+        a,b=chosen.split(' / ')
+    fixture_banner(a,b,f'{season} · Week {week}')
+    entries=[r for r in s.get('injury_data',{}).get('entries',{}).values() if r['Season']==season and r['Week']==week and r['Team'] in {a,b}]
+    if entries:
+        display=pd.DataFrame(entries)[['Player','Team','Position','Status','Exclude Props','Notes']]
+        st.dataframe(display,hide_index=True,use_container_width=True)
+    else:
+        st.info('No injury notes saved for these teams in this week.')
+    if not is_admin():
+        st.caption('Enter your Admin password to add or change injuries.')
+        return
+    if s.get('injury_sync_error'):
+        st.warning(s.injury_sync_error)
+    if st.button('Sync injury exclusions to saved model picks'):
+        try:
+            sync_injury_exclusions()
+            s.injury_sync_error=None
+            st.success('Pregame model exclusions synchronized.')
+        except (RuntimeError,ValueError) as error:
+            st.error(str(error))
+    team=st.selectbox('Injured player’s team',[a,b],format_func=lambda t:TEAM_NAMES[t])
+    roster=[]
+    for kind in ['season_passing','season_rushing','season_receiving']:
+        t=s.tables.get(kind)
+        if t is not None:
+            roster.extend(t[t.Team==team].Player.tolist())
+    roster=sorted(set(roster))
+    selected=st.selectbox('Player',['Type a player name']+roster,key='injury_roster')
+    player=st.text_input('Player name',value='' if selected=='Type a player name' else selected,key='injury_name_'+team+'_'+player_key(selected))
+    positions=['QB','RB','WR','TE','OL','CB','S','LB','DL','K','Other']
+    note=matching_injury(player,team,season,week) if player.strip() else None
+    inferred=None
+    for kind in ['season_passing','season_rushing','season_receiving']:
+        roster_table=s.tables.get(kind)
+        if roster_table is not None:
+            matches=roster_table[(roster_table.Team==team)&(roster_table.Player.map(player_key)==player_key(player))]
+            if not matches.empty:
+                inferred=matches.iloc[0].Position
+                break
+    default_position=note['Position'] if note else (inferred if inferred in positions else 'Other')
+    position=st.selectbox('Position',positions,index=positions.index(default_position) if default_position in positions else positions.index('Other'),key='injury_position_'+team+'_'+player_key(player))
+    statuses=['Out','Limited / snap count','Questionable','Missed practice','Returning','Healthy / cleared']
+    status=st.selectbox('Status',statuses,index=statuses.index(note['Status']) if note else 0,key='injury_status_'+team+'_'+player_key(player))
+    default=note.get('Exclude Props') if note and note['Status']==status else status in {'Out','Limited / snap count'}
+    excluded=st.checkbox('Exclude this player’s props this week',value=True if status=='Out' else bool(default),disabled=status=='Out',key='injury_exclude_'+team+'_'+player_key(player)+'_'+status)
+    notes=st.text_area('Notes / reason',value=note.get('Notes','') if note else '',key='injury_notes_'+team+'_'+player_key(player))
+    st.caption('Out always excludes props. Limited defaults to excluded. Questionable and missed practice do not automatically mean Out. Imported lines stay saved; saved personal picks receive an alert.')
+    if st.button('Save injury entry',type='primary'):
+        try:
+            if not player.strip():
+                raise ValueError('Enter a player name.')
+            save_injury({'Season':int(season),'Week':int(week),'Team':team,'Opponent':b if team==a else a,
+                         'Player':player.strip(),'Key':player_key(player),'Position':position,'Status':status,
+                         'Exclude Props':bool(excluded),'Notes':notes.strip()})
+            st.success('Injury saved for this week only. Pregame prop exclusions applied; projection formulas unchanged.')
+            st.rerun()
+        except (RuntimeError,ValueError) as error:
+            st.error(str(error))
+
+
+def weekly_records_table(groups):
+    rows=[]
+    for title,picks in groups:
+        buckets={}
+        for p in picks:
+            w=record_week(p)
+            if w:
+                buckets.setdefault(w,[]).append(p)
+        for (season,week),part in sorted(buckets.items()):
+            counts={r:sum(p['Result']==r for p in part) for r in ['Won','Lost','Push','Void','Pending','Needs review']}
+            w,l=counts['Won'],counts['Lost']
+            rows.append({'Record':title,'Season':season,'Week':week,'Label':'Official' if official_pick(part[0]) else ('Pilot' if (season,week)==(2026,6) else 'Not in cumulative'),
+                         'Wins':w,'Losses':l,'Pushes':counts['Push'],'Pending / Review':counts['Pending']+counts['Needs review'],'Void':counts['Void'],
+                         'Hit Rate %':100*w/(w+l) if w+l else float('nan'),
+                         'Model Versions':', '.join(sorted({p.get('Model Version','Unknown') for p in part}))})
+    return pd.DataFrame(rows)
+
+
+def manual_prop_entry_ui():
+    s = st.session_state
+    if is_admin():
+        with st.expander('Manual prop entry'):
+            st.caption('Use a game from the API event list so the player, opponent, kickoff, and event identifier can be matched.')
+            try:
+                manual_games = {e['id']: e for e in events()}
+                if manual_games:
+                    with st.form('manual_prop'):
+                        manual_event = st.selectbox('Game', list(manual_games), format_func=lambda k: f"{manual_games[k]['away_team']} at {manual_games[k]['home_team']}", key='manual_game')
+                        manual_player = st.text_input('Player name')
+                        manual_stat = st.selectbox('Stat', list(MARKETS))
+                        manual_line = st.number_input('Line', min_value=0.0, value=0.5, step=0.5)
+                        over_odds = st.number_input('Over odds (American)', value=-110, step=1)
+                        under_odds = st.number_input('Under odds (American)', value=-110, step=1)
+                        book = st.text_input('Sportsbook', value='Manual')
+                        submitted = st.form_submit_button('Add manual prop')
+                    if submitted:
+                        event = manual_games[manual_event]
+                        if not manual_player.strip() or any(abs(v) < 100 for v in (over_odds, under_odds)):
+                            st.error('Enter a player and American odds of +100 or higher, or -100 or lower.')
+                        elif pd.to_datetime(event['commence_time'], utc=True) <= pd.Timestamp.now(tz='UTC'):
+                            st.error('Choose a game that has not started.')
+                        else:
+                            now = datetime.now(timezone.utc).isoformat()
+                            common = {'Player': manual_player.strip(), 'Stat': manual_stat, 'Line': manual_line,
+                                      'Away': team_code(event['away_team']), 'Home': team_code(event['home_team']),
+                                      'Matchup': f"{event['away_team']} at {event['home_team']}",
+                                      'Kickoff (UTC)': event['commence_time'], 'Event ID': manual_event,
+                                      'Updated (UTC)': now, 'Fetched': now, 'Bookmaker': book.strip() or 'Manual'}
+                            new_rows = pd.DataFrame([{**common, 'Side': 'Over', 'Odds': over_odds}, {**common, 'Side': 'Under', 'Odds': under_odds}])
+                            s.props = pd.concat([s.props, new_rows], ignore_index=True)
+                            s.props = s.props.drop_duplicates(['Event ID', 'Player', 'Stat', 'Line', 'Side', 'Bookmaker'], keep='last')
+                            s.props_dirty=True
+                            save_props_snapshot(s.props)
+                            st.success('Manual line added and saved permanently.')
+                            st.rerun()
+            except RuntimeError as e:
+                st.error(str(e))
+
+def app_style():
+    st.markdown('''<style>
+    .block-container {padding:1.5rem 2rem 4rem;max-width:1650px;}
+    [data-testid="stAppViewContainer"] {background:linear-gradient(180deg,rgba(14,165,233,.065),transparent 600px);}
+    .hero-panel {background:linear-gradient(115deg,#082f49 0%,#164e63 60%,#087f70 100%);color:white;border-radius:20px;padding:28px 32px;margin-bottom:24px;box-shadow:0 10px 26px #082f491f;}
+    .hero-eyebrow {color:#99f6e4;font-size:13px;font-weight:800;letter-spacing:2px;text-transform:uppercase;}
+    .hero-title {color:#fff;font-size:clamp(28px,4vw,42px);font-weight:850;line-height:1.2;margin:8px 0;}
+    .hero-caption {color:#d5f3f4;font-size:17px;line-height:1.6;}
+    .fixture-banner {display:flex;align-items:center;gap:18px;background:linear-gradient(105deg,#f0f9ff,#f0fdfa);border-radius:14px;padding:16px 22px;margin:15px 0;color:#0c354b;box-shadow:0 3px 14px #082f490c;}
+    .fixture-banner img {width:64px;height:64px;object-fit:contain;}
+    .fixture-banner div:nth-child(2){flex:1;}
+    .fixture-title {font-size:23px;font-weight:800;line-height:1.25;}
+    .fixture-caption {font-size:14px;color:#486b7c;margin-top:6px;}
+    [data-testid="stMetric"] {background:linear-gradient(120deg,#102d48,#155e75);padding:18px;border-radius:14px;border-bottom:4px solid #2dd4bf;margin:5px 0 14px;}
+    [data-testid="stMetric"] * {color:#f0fdfa !important;}
+    [data-testid="stMetricValue"] {font-size:32px;font-weight:800;}
+    h2,h3 {letter-spacing:-.4px;}
+    [data-testid="stMarkdownContainer"] p,[data-testid="stWidgetLabel"] p {font-size:16px;line-height:1.55;}
+    button[data-baseweb="tab"] {font-size:16px;font-weight:700;padding:12px 16px;}
+    [data-baseweb="tab-list"] {gap:6px;flex-wrap:wrap;}
+    button[data-baseweb="tab"][aria-selected="true"] {color:#087f70;background:#ccfbf1;border-radius:10px 10px 0 0;}
+    .stButton>button[kind="primary"] {background:#087f70;border-color:#087f70;border-radius:10px;font-weight:750;min-height:44px;}
+    [data-testid="stExpander"] {border-radius:13px;}
+    [data-testid="stDataFrame"] {border-radius:12px;overflow:hidden;border:1px solid #cbd5e144;}
+    @media(max-width:700px){.block-container{padding:1rem .8rem;}.fixture-banner{padding:12px;gap:10px;}.fixture-title{font-size:18px;}.fixture-banner img{width:42px;height:42px;}.hero-panel{padding:20px;}}
+    </style>''',unsafe_allow_html=True)
+    st.markdown('''<div class="hero-panel"><div class="hero-eyebrow">NFL · Matchup research</div>
+    <div class="hero-title">NFL Matchup Analytics</div>
+    <div class="hero-caption">Explore the matchup. Choose your side. Track what happens.</div></div>''',unsafe_allow_html=True)
+
+
 def main():
     st.set_page_config(page_title='NFL Matchup Analytics', page_icon='🏈', layout='wide')
     for key, value in {'tables': {}, 'source_bytes': {}, 'projections': pd.DataFrame(), 'issues': pd.DataFrame(),
@@ -1424,19 +1850,13 @@ def main():
                 restore_saved_state()
             except (RuntimeError, ValueError, KeyError, OSError) as error:
                 s.restore_error = str(error)
+    if s.get('injury_load_error'):
+        st.warning('Injury notes did not load. Refresh them in Injuries before saving new selections.')
     if s.get('restore_error'):
         st.warning('Saved data could not fully restore: '+s.restore_error+'. Use Reload saved data and props to retry.')
-    st.markdown('''<style>
-    .block-container {padding-top:2rem; max-width:1600px;}
-    [data-testid="stMetric"] {background:linear-gradient(120deg,#10243b,#184e64);padding:18px;border-radius:14px;border-bottom:3px solid #34d399;color:#f1f5f9;}
-    [data-testid="stMetric"] * {color:#f1f5f9 !important;}
-    .stButton>button[kind="primary"] {background:#087f70;border-color:#087f70;border-radius:9px;}
-    button[data-baseweb="tab"] {font-weight:650;}
-    </style>''', unsafe_allow_html=True)
-    st.title('🏈 NFL Matchup Analytics')
-    st.caption('Player strengths × defensive matchups · Your projections, your picks, your record')
-    weekly, comparisons, all_model_tab, picks_tab, best_tab, dashboard_tab, methodology, admin = st.tabs([
-        'Projections & Matchups', 'Prop Comparisons', 'All Model Picks', 'My Picks', '20 Best Picks of the Day', 'Records Dashboard', 'Methodology', 'Admin / Update Data'])
+    app_style()
+    weekly, all_model_tab, picks_tab, best_tab, dashboard_tab, injuries_tab, methodology, admin = st.tabs([
+        'Projections & Matchups', 'All Model Picks', 'My Picks', '20 Best Picks of the Day', 'Records Dashboard', 'Injuries', 'Methodology', 'Admin / Update Data'])
 
     with admin:
         st.text_input('Admin password', type='password', key='admin_password')
@@ -1453,12 +1873,13 @@ def main():
                     st.warning('Could not load saved thresholds: ' + str(error))
                 s.settings_checked = True
             settings_ui()
+            record_policy_ui()
             persistence_controls()
             st.subheader('Weekly data batch')
             c1, c2, c3 = st.columns(3)
             season = c1.number_input('Season', 2020, 2100, int((s.batch_meta or {}).get('season',2026)))
-            cutoff = c2.number_input('Stats through week', 1, 18, int((s.batch_meta or {}).get('cutoff',5)))
-            week = c3.number_input('Project week', 1, 22, int((s.batch_meta or {}).get('week',6)))
+            cutoff = c2.number_input('Stats through week', 1, 18, int((s.batch_meta or {}).get('cutoff',6)))
+            week = c3.number_input('Project week', 1, 22, int((s.batch_meta or {}).get('week',7)))
             label = st.selectbox('CSV category', list(DATASETS))
             kind = DATASETS[label]
             uploads = st.file_uploader('Upload CSVs (one or several)', type=['csv'], accept_multiple_files=True)
@@ -1555,6 +1976,9 @@ def main():
             except RuntimeError as e:
                 st.error(str(e))
 
+    with injuries_tab:
+        injuries_page()
+
     with weekly:
         if st.button('Reload saved data and props (no Odds API credits)'):
             try:
@@ -1580,6 +2004,7 @@ def main():
                 p = p[p.Team == team]
                 logo_code = {'WAS': 'wsh'}.get(team, team.lower())
                 st.image(f'https://a.espncdn.com/i/teamlogos/nfl/500/{logo_code}.png', width=64)
+            p=game_filter_frame(p,'projection_game')
             search = st.text_input('Find a player', key='projection_search')
             if search:
                 p = p[p.Player.str.contains(search, case=False, regex=False)]
@@ -1607,68 +2032,6 @@ def main():
         finally:
             s.register_slate = False
 
-    with comparisons:
-        if is_admin():
-            with st.expander('Manual prop entry'):
-                st.caption('Use a game from the API event list so the player, opponent, kickoff, and event identifier can be matched.')
-                try:
-                    manual_games = {e['id']: e for e in events()}
-                    if manual_games:
-                        with st.form('manual_prop'):
-                            manual_event = st.selectbox('Game', list(manual_games), format_func=lambda k: f"{manual_games[k]['away_team']} at {manual_games[k]['home_team']}", key='manual_game')
-                            manual_player = st.text_input('Player name')
-                            manual_stat = st.selectbox('Stat', list(MARKETS))
-                            manual_line = st.number_input('Line', min_value=0.0, value=0.5, step=0.5)
-                            over_odds = st.number_input('Over odds (American)', value=-110, step=1)
-                            under_odds = st.number_input('Under odds (American)', value=-110, step=1)
-                            book = st.text_input('Sportsbook', value='Manual')
-                            submitted = st.form_submit_button('Add manual prop')
-                        if submitted:
-                            event = manual_games[manual_event]
-                            if not manual_player.strip() or any(abs(v) < 100 for v in (over_odds, under_odds)):
-                                st.error('Enter a player and American odds of +100 or higher, or -100 or lower.')
-                            elif pd.to_datetime(event['commence_time'], utc=True) <= pd.Timestamp.now(tz='UTC'):
-                                st.error('Choose a game that has not started.')
-                            else:
-                                now = datetime.now(timezone.utc).isoformat()
-                                common = {'Player': manual_player.strip(), 'Stat': manual_stat, 'Line': manual_line,
-                                          'Away': team_code(event['away_team']), 'Home': team_code(event['home_team']),
-                                          'Matchup': f"{event['away_team']} at {event['home_team']}",
-                                          'Kickoff (UTC)': event['commence_time'], 'Event ID': manual_event,
-                                          'Updated (UTC)': now, 'Fetched': now, 'Bookmaker': book.strip() or 'Manual'}
-                                new_rows = pd.DataFrame([{**common, 'Side': 'Over', 'Odds': over_odds}, {**common, 'Side': 'Under', 'Odds': under_odds}])
-                                s.props = pd.concat([s.props, new_rows], ignore_index=True)
-                                s.props = s.props.drop_duplicates(['Event ID', 'Player', 'Stat', 'Line', 'Side', 'Bookmaker'], keep='last')
-                                s.props_dirty=True
-                                save_props_snapshot(s.props)
-                                st.success('Manual line added and saved permanently.')
-                except RuntimeError as e:
-                    st.error(str(e))
-        d = prop_comparisons(s.projections, s.props)
-        st.caption('Projection minus line: positive suggests Over, negative suggests Under. Differences are not estimated win probabilities.')
-        if not d.empty:
-            stat = st.selectbox('Comparison stat', sorted(d.Stat.unique()))
-            view = d[d.Stat == stat].copy()
-            # One row per player/game/stat/line, with each side’s odds in columns.
-            keys = ['Player', 'Matchup', 'Bookmaker', 'Stat', 'Line', 'Projection', 'Difference', 'Difference %', 'Direction']
-            view = view.pivot_table(index=keys, columns='Side', values='Odds', aggfunc='first').reset_index()
-            rank = st.selectbox('Sort differences', ['Largest absolute difference', 'Largest positive', 'Largest negative'])
-            if rank == 'Largest absolute difference':
-                view = view.iloc[view.Difference.abs().argsort()[::-1]]
-            else:
-                view = view.sort_values('Difference', ascending=rank == 'Largest negative')
-            search = st.text_input('Search player')
-            if search:
-                view = view[view.Player.str.contains(search, case=False, regex=False)]
-            styled_table(view.rename(columns={'Direction': 'Over / Under'}).round(2))
-            st.download_button('Download comparisons', view.to_csv(index=False), 'comparisons.csv', 'text/csv')
-        else:
-            st.info('No matching upcoming props and projections yet. Imports must match both player and opponent; completed games are excluded.')
-        with st.expander('Imported sportsbook lines'):
-            if not s.props.empty:
-                st.caption('Fetch times: ' + ', '.join(sorted(s.props.Fetched.unique())))
-                st.dataframe(s.props[['Player', 'Matchup', 'Stat', 'Side', 'Line', 'Odds']], hide_index=True)
-        select_pick_ui(s.projections, s.props)
     with picks_tab:
         picks_page()
 
@@ -1681,7 +2044,7 @@ def main():
         records_dashboard()
 
     with methodology:
-        st.markdown("""### Model v2 · agreed calculation rules
+        st.markdown("""### Projection formulas · unchanged in this interface update
 - **Player selection:** up to two WRs and one QB, TE, RB per team, ranked by primary season yards/game. QB selection carries over to QB rushing; RB selection carries over to RB receiving. This is a production filter, not a verified depth chart.
 - **WR/TE targeting:** season targets/game adjusted by opponent-weighted targets/route relative to historical route-weighted targets/route. Each coverage target rate uses a 50-route prior toward the player's combined man/zone target rate.
 - **WR/TE production:** each coverage's catch rate and yards/target use a 10-target prior toward season efficiency. Coverage contributions are weighted by expected targets, so targeting is counted once. Split targets are estimated from routes × rounded targets/route; missing splits use labeled season baselines.
@@ -1692,6 +2055,8 @@ def main():
 - **QB rushing:** season rushing yards/game × QB-specific defensive rushing multiplier.
 - **Matchup rating:** compare the final forecast with the same smoothed model under the player's own scheme mix and a neutral defense. Score = 5.5 + 4.5 × tanh(log(forecast/neutral)/0.35). Neutral is 5.5; 10 is the strongest end and 1 the weakest end of this heuristic scale. It measures production matchup, not player ability or the probability of beating a line. Undefined neutral baselines show no score.
 - **Separate ratings:** defense compares the final forecast to its pre-defense forecast; coverage/scheme compares the pre-defense forecast with its neutral baseline. All use the same 1–10 transformation. Signals are Mixed when ratings lie on opposite sides of the neutral band 5.2–5.8. Missing scheme data shows — and Defense only.
+- **Interface v6:** projection formulas are unchanged. Game filters and pick entry live in My Picks. Injuries store weekly notes and prop exclusions only; no workload redistribution or injury efficiency multipliers are applied. Out excludes automatically; Limited defaults to excluded; other statuses are informational unless explicitly excluded. Saved model eligibility changes only before kickoff. Personal saved picks retain their original lines and receive injury alerts.
+- **Record policy:** 2026 Week 6 is retained as Pilot; official cumulative totals begin Week 7. Weekly history preserves all three records and model versions. Future inclusion-policy changes cannot remove started official weeks.
 - **Persistence:** accepted CSVs save immediately, validation saves their confirmation, and each successful prop fetch saves before the next game is requested. Saved inputs/props auto-restore on a new session. Imports reuse stored games unless fresh lines are explicitly requested. An empty saved batch is a clear marker and never resurrects older published CSVs. Existing picks and records are not cleared with weekly data.
 - **No-pick ranges:** defaults ±10 passing yards, ±5 receiving/rushing yards, ±0.5 receptions, inclusive at the boundary. Admin can save different ranges. These affect new registrations and current display, not already saved forecasts or personal choices. Each official pick retains its threshold.
 - **All Model / Top 20:** official forecasts are saved once per player/event/stat, using the first registered DraftKings line. Crossed-off forecasts retain an audit trail but do not count in that record. Exclusion/restore locks at kickoff. All Model exclusions also disqualify Top 20; Top 20-only exclusions do not change All Model. Top 20 ranks absolute differences across stats (different units), selects one prop per player, and blocks that player for the day when crossed off. Started slots freeze. Historical started selections are preserved even if older versions allowed several props per player. Fewer than 20 is shown when there are not enough eligible forecasts. Days use America/Los_Angeles.
