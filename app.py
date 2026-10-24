@@ -1855,8 +1855,27 @@ def main():
     if s.get('restore_error'):
         st.warning('Saved data could not fully restore: '+s.restore_error+'. Use Reload saved data and props to retry.')
     app_style()
-    weekly, all_model_tab, picks_tab, best_tab, dashboard_tab, injuries_tab, methodology, admin = st.tabs([
-        'Projections & Matchups', 'All Model Picks', 'My Picks', '20 Best Picks of the Day', 'Records Dashboard', 'Injuries', 'Methodology', 'Admin / Update Data'])
+        (
+        weekly,
+        all_model_tab,
+        picks_tab,
+        best_tab,
+        dashboard_tab,
+        explorer,
+        injuries_tab,
+        methodology,
+        admin,
+    ) = st.tabs([
+        "Projections & Matchups",
+        "All Model Picks",
+        "My Picks",
+        "20 Best Picks of the Day",
+        "Records Dashboard",
+        "Pick Explorer",
+        "Injuries",
+        "Methodology",
+        "Admin / Update Data",
+    ])
 
     with admin:
         st.text_input('Admin password', type='password', key='admin_password')
@@ -2040,8 +2059,204 @@ def main():
     with best_tab:
         best20_page()
 
-    with dashboard_tab:
+        with dashboard_tab:
         records_dashboard()
+
+    with explorer:
+            with explorer:
+        st.subheader("Pick Explorer")
+        st.caption(
+            "Browse saved past and current picks. Week 6 pilot picks "
+            "remain available here. These filters do not change any records."
+        )
+
+        if st.button("Load / refresh explorer", key="explorer_refresh"):
+            try:
+                tracker, _ = load_tracker()
+                raw = github("data/my_picks.json")
+                st.session_state.explorer_data = {
+                    "tracker": tracker,
+                    "personal": json.loads(raw) if raw else [],
+                }
+            except (RuntimeError, ValueError) as error:
+                st.error(str(error))
+
+        saved = st.session_state.get("explorer_data")
+
+        if saved is None:
+            st.info("Click Load / refresh explorer to load your saved picks.")
+        else:
+            source = st.selectbox(
+                "Which picks?",
+                ["All Model Picks", "My Picks", "Top 20"],
+                key="explorer_source",
+            )
+            tracker = saved["tracker"]
+
+            if source == "My Picks":
+                rows = saved["personal"]
+            elif source == "Top 20":
+                ids = {
+                    pid
+                    for day in tracker["days"].values()
+                    for pid in day["active"]
+                    if pid not in day.get("excluded", {})
+                }
+                rows = [
+                    pick
+                    for pid, pick in tracker["picks"].items()
+                    if pid in ids
+                ]
+            else:
+                rows = list(tracker["picks"].values())
+
+            if not rows:
+                st.info("No saved picks found for this source.")
+            else:
+                table = pd.DataFrame(rows).copy()
+
+                numeric_columns = [
+                    "Season", "Week", "Line", "Actual",
+                    "Projection When Picked", "Season Average",
+                ]
+                for column in numeric_columns:
+                    if column not in table:
+                        table[column] = float("nan")
+                    table[column] = pd.to_numeric(
+                        table[column], errors="coerce"
+                    )
+
+                for column in [
+                    "Player", "Position", "Team", "Opponent", "Stat"
+                ]:
+                    if column not in table:
+                        table[column] = "Unknown"
+                    table[column] = table[column].fillna("Unknown")
+
+                for column, default in [
+                    ("Result", "Pending"),
+                    ("Your Pick", "Unknown"),
+                    ("Result Note", ""),
+                ]:
+                    if column not in table:
+                        table[column] = default
+                    table[column] = table[column].fillna(default)
+
+                table["Excluded"] = (
+                    table.get(
+                        "Excluded",
+                        pd.Series(False, index=table.index),
+                    ).fillna(False).astype(bool)
+                    | table.get(
+                        "Injury Excluded",
+                        pd.Series(False, index=table.index),
+                    ).fillna(False).astype(bool)
+                )
+
+                view = table.copy()
+                columns = st.columns(3)
+
+                filters = [
+                    ("Season", "Season"),
+                    ("Week", "Week"),
+                    ("Position", "Position"),
+                    ("Team", "Team"),
+                    ("Stat", "Stat"),
+                    ("Result", "Result"),
+                    ("Your Pick", "Over / Under"),
+                ]
+
+                for index, (column, label) in enumerate(filters):
+                    values = sorted(
+                        table[column].dropna().unique().tolist()
+                    )
+                    if column in {"Season", "Week"}:
+                        values = [int(value) for value in values]
+
+                    selection = columns[index % 3].selectbox(
+                        label,
+                        ["All"] + values,
+                        key="explorer_filter_" + column,
+                    )
+                    if selection != "All":
+                        view = view[view[column] == selection]
+
+                search = st.text_input(
+                    "Search player",
+                    key="explorer_search",
+                )
+                if search.strip():
+                    view = view[
+                        view["Player"].str.contains(
+                            search.strip(),
+                            case=False,
+                            regex=False,
+                        )
+                    ]
+
+                include_excluded = st.checkbox(
+                    "Include crossed-off / injury-excluded model picks",
+                    value=False,
+                    key="explorer_excluded",
+                )
+                if source != "My Picks" and not include_excluded:
+                    view = view[~view["Excluded"]]
+
+                view["Projection Error"] = (
+                    view["Projection When Picked"] - view["Actual"]
+                )
+
+                order = st.selectbox(
+                    "Sort by",
+                    ["Largest projection miss", "Player", "Team", "Week"],
+                    key="explorer_sort",
+                )
+                if order == "Largest projection miss":
+                    view = view.assign(
+                        _error=view["Projection Error"].abs()
+                    ).sort_values(
+                        "_error",
+                        ascending=False,
+                        na_position="last",
+                    )
+                else:
+                    view = view.sort_values(
+                        order,
+                        na_position="last",
+                    )
+
+                st.caption(
+                    "This record covers only the filtered picks, including "
+                    "any pilot weeks selected. Positive projection error "
+                    "means we projected too high."
+                )
+                record_metrics(
+                    view.to_dict("records"),
+                    "explorer",
+                )
+
+                display = view.rename(columns={
+                    "Your Pick": "Pick",
+                    "Projection When Picked": "Our Projection",
+                    "Result Note": "Notes",
+                })
+                display_columns = [
+                    "Season", "Week", "Player", "Position",
+                    "Team", "Opponent", "Stat", "Pick",
+                    "Line", "Season Average", "Our Projection",
+                    "Actual", "Projection Error", "Result",
+                    "Excluded", "Notes",
+                ]
+
+                styled_table(display[display_columns])
+
+                st.download_button(
+                    "Download filtered picks",
+                    display[display_columns].to_csv(index=False),
+                    file_name="filtered_picks.csv",
+                    mime="text/csv",
+                    key="explorer_download",
+                )
 
     with methodology:
         st.markdown("""### Projection formulas · unchanged in this interface update
