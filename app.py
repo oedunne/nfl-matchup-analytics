@@ -2190,6 +2190,89 @@ def matchup_review_ui():
 
 
 
+# Separate browser file reader: sends selected bytes through the component channel,
+# rather than relying on Streamlit's native file-upload widget or upload endpoint.
+CSV_READER_HTML = r'''<!doctype html><html><head><meta charset="utf-8"><style>
+body{font:16px system-ui,sans-serif;margin:0;color:#15354b;background:transparent}
+#zone{border:2px dashed #0d9488;border-radius:14px;background:#f0fdfa;padding:20px;text-align:center}
+#zone.active{background:#ccfbf1;border-style:solid}button{font:600 16px system-ui;background:#087f70;color:white;padding:12px 20px;border:0;border-radius:8px;cursor:pointer}
+p{margin:10px 0}#status{font-size:14px;white-space:pre-wrap;margin-top:10px}button:disabled{opacity:.5}
+</style></head><body><section id="zone"><strong>Alternative CSV file upload</strong>
+<p>Drag downloaded CSV files into this box</p><button id="choose" type="button">Choose CSV files</button>
+<input id="files" type="file" accept=".csv,text/csv" multiple hidden>
+<div id="status" role="status" aria-live="polite">Files stay in your app. No copying or pasting needed.</div></section>
+<script>
+const input=document.getElementById('files'),zone=document.getElementById('zone'),status=document.getElementById('status'),button=document.getElementById('choose');
+function send(type,extra={}){window.parent.postMessage({isStreamlitMessage:true,type,...extra},'*')}
+function height(){send('streamlit:setFrameHeight',{height:Math.max(235,document.body.scrollHeight+12)})}
+function read(file){return new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(String(reader.result).split(',')[1]);reader.onerror=()=>reject(new Error('Could not read '+file.name));reader.readAsDataURL(file)})}
+async function accept(files){
+ const list=Array.from(files||[]);if(!list.length)return;
+ try{
+  if(list.length>40)throw new Error('Select no more than 40 files at once.');
+  for(const file of list){if(!file.name.toLowerCase().endsWith('.csv'))throw new Error(file.name+': select a .csv file.');if(file.size>500000)throw new Error(file.name+': CSV must be under 500 KB.');if(!file.size)throw new Error(file.name+': file is empty.');}
+  button.disabled=true;status.textContent='Reading '+list.length+' file(s)…';height();
+  const output=[];for(const file of list)output.push({name:file.name,size:file.size,data:await read(file)});
+  send('streamlit:setComponentValue',{value:{nonce:String(Date.now())+'-'+Math.random().toString(36).slice(2),files:output},dataType:'json'});
+  status.textContent='Read '+output.length+' file(s):\n'+output.map(f=>f.name).join('\n')+'\nReview the previews below, then click Accept previewed files into this batch.';
+ }catch(error){status.textContent=error.message;}finally{button.disabled=false;input.value='';height();}
+}
+button.addEventListener('click',()=>input.click());input.addEventListener('change',()=>accept(input.files));
+for(const event of ['dragenter','dragover'])zone.addEventListener(event,e=>{e.preventDefault();e.stopPropagation();if(e.dataTransfer)e.dataTransfer.dropEffect='copy';zone.classList.add('active')});
+zone.addEventListener('dragleave',()=>zone.classList.remove('active'));
+zone.addEventListener('drop',e=>{e.preventDefault();e.stopPropagation();zone.classList.remove('active');accept(e.dataTransfer.files)});
+window.addEventListener('message',e=>{if(e.source===window.parent&&e.data&&e.data.type==='streamlit:render'){button.disabled=Boolean(e.data.disabled);height();}});
+send('streamlit:componentReady',{apiVersion:1});height();
+</script></body></html>'''
+
+
+@st.cache_resource(show_spinner=False)
+def csv_reader_component(source):
+    import tempfile
+    from pathlib import Path
+    import streamlit.components.v1 as components
+    directory=Path(tempfile.mkdtemp(prefix='nfl-csv-reader-'))
+    (directory/'index.html').write_text(source,encoding='utf-8')
+    return components.declare_component('nfl_csv_reader',path=str(directory))
+
+
+def decode_browser_csvs(payload):
+    if not isinstance(payload,dict) or not isinstance(payload.get('files'),list):
+        raise ValueError('Invalid file selection. Try choosing the CSVs again.')
+    if not 1<=len(payload['files'])<=40:raise ValueError('Choose between 1 and 40 CSV files.')
+    files=[]
+    for item in payload['files']:
+        if not isinstance(item,dict):raise ValueError('Invalid selected file.')
+        name=str(item.get('name','')).replace('\\','/').rsplit('/',1)[-1]
+        if not name.lower().endswith('.csv'):raise ValueError('Only .csv files are supported.')
+        encoded=item.get('data','')
+        if not isinstance(encoded,str) or len(encoded)>666668:raise ValueError(name+': CSV must be under 500 KB.')
+        try:raw=base64.b64decode(encoded,validate=True)
+        except (ValueError,TypeError):raise ValueError(name+': file could not be decoded. Select it again.') from None
+        if not raw or len(raw)>500000:raise ValueError(name+': select a nonempty CSV under 500 KB.')
+        if item.get('size')!=len(raw):raise ValueError(name+': incomplete file transfer. Select it again.')
+        file=io.BytesIO(raw);file.name=name;file.size=len(raw);files.append(file)
+    return files
+
+
+def alternate_csv_uploads():
+    s=st.session_state
+    st.caption('If Browse files does nothing, use the independent file-upload box below. It accepts your downloaded CSV files directly.')
+    if st.button('Reset file upload boxes',key='reset_csv_readers'):
+        s.csv_reader_generation=s.get('csv_reader_generation',0)+1
+        s.pop('browser_csv_files',None);s.pop('browser_csv_nonce',None)
+        st.rerun()
+    component=csv_reader_component(CSV_READER_HTML)
+    payload=component(key='csv_reader_'+str(s.get('csv_reader_generation',0)),default=None)
+    if payload and payload.get('nonce')!=s.get('browser_csv_nonce'):
+        try:
+            s.browser_csv_files=decode_browser_csvs(payload)
+            s.browser_csv_nonce=payload.get('nonce')
+        except (ValueError,KeyError,TypeError) as error:
+            st.error(str(error));return []
+    return s.get('browser_csv_files',[])
+
+
 def main():
     st.set_page_config(page_title='NFL Matchup Analytics', page_icon='🏈', layout='wide')
     for key, value in {'tables': {}, 'source_bytes': {}, 'projections': pd.DataFrame(), 'issues': pd.DataFrame(),
@@ -2237,7 +2320,8 @@ def main():
             week = c3.number_input('Project week', 1, 22, int((s.batch_meta or {}).get('week',7)))
             label = st.selectbox('CSV category', list(DATASETS))
             kind = DATASETS[label]
-            uploads = st.file_uploader('Upload CSVs (one or several)', type=['csv'], accept_multiple_files=True)
+            uploads = list(st.file_uploader('Upload CSVs (one or several)', type=['csv'], accept_multiple_files=True, key='native_csv_'+str(s.get('csv_reader_generation',0))) or [])
+            uploads += alternate_csv_uploads()
             name_map = {
                 'qbs under pressure':'pressure_qb', 'official offensive pressure':'pressure_offense',
                 'defensive pressure':'pressure_defense','average targeted air':'receiver_ngs',
