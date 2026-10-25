@@ -1855,7 +1855,7 @@ def main():
     if s.get('restore_error'):
         st.warning('Saved data could not fully restore: '+s.restore_error+'. Use Reload saved data and props to retry.')
     app_style()
-        (
+(
         weekly,
         all_model_tab,
         picks_tab,
