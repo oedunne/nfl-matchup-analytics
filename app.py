@@ -19,7 +19,7 @@ from urllib.request import Request, urlopen
 import pandas as pd
 import streamlit as st
 
-MODEL_VERSION = '5.0-auto-save-and-restore'
+MODEL_VERSION = '7.0-workload-pressure-box'
 API_BASE = 'https://api.the-odds-api.com/v4'
 SPORT = 'americanfootball_nfl'
 MARKETS = {'Passing yards': 'player_pass_yds', 'Rushing yards': 'player_rush_yds',
@@ -54,7 +54,7 @@ TEAM_NAMES = {
     'SEA': 'Seattle Seahawks', 'SF': 'San Francisco 49ers', 'TB': 'Tampa Bay Buccaneers',
     'TEN': 'Tennessee Titans', 'WAS': 'Washington Commanders',
 }
-ALIASES = {'ARZ': 'ARI', 'BLT': 'BAL', 'CLV': 'CLE', 'HST': 'HOU', 'JAC': 'JAX',
+ALIASES = {'AZ': 'ARI', 'ARZ': 'ARI', 'BLT': 'BAL', 'CLV': 'CLE', 'HST': 'HOU', 'JAC': 'JAX',
            'LA': 'LAR', 'OAK': 'LV', 'SD': 'LAC', 'SL': 'LAR', 'WSH': 'WAS'}
 
 
@@ -83,6 +83,8 @@ def number(series):
 
 
 def parse_csv(raw, kind):
+    if kind in EXTRA_KINDS:
+        return parse_extra(raw, kind)
     rows = list(csv.reader(io.StringIO(raw.decode('utf-8-sig'))))
     if not rows:
         raise ValueError('The CSV is empty.')
@@ -163,11 +165,13 @@ def parse_csv(raw, kind):
     return d.reset_index(drop=True)
 
 
-def build_model(tables, cutoff, defense_weight=0.5):
+def build_model(tables, cutoff, defense_weight=0.632):
     missing = REQUIRED - tables.keys()
     if missing:
         raise ValueError('Upload these datasets first: ' + ', '.join(sorted(missing)))
     issues, output = [], []
+    workload_map, workload_notes = projected_workloads(tables, cutoff)
+    issues.extend(workload_notes)
     cov = tables['defensive_coverage'].set_index('Team')
     runs = tables['defensive_run_splits'].set_index('Team')
     splits = {k: v.set_index('Key') for k, v in tables.items() if 'Key' in v}
@@ -211,6 +215,7 @@ def build_model(tables, cutoff, defense_weight=0.5):
         t['Rank YPG'] = t.YDS / t.GP
         t = t.sort_values(['Rank YPG', 'Player'], ascending=[False, True])
         for (team, pos), group in t.groupby(['Team', 'Position']):
+            group = group[group.apply(lambda r: availability(r.Key, r.Team) > 0, axis=1)]
             selected.update(group.head(2 if pos == 'WR' else 1).Key)
 
     def add(row, stat, projection, neutral, workload, detail, df=1.0, pre_defense=None, scheme_known=False):
@@ -254,7 +259,7 @@ def build_model(tables, cutoff, defense_weight=0.5):
             if kind == 'season_passing':
                 if not valid(r.ATT) or r.ATT <= 0:
                     continue
-                base_ypa, attempts = r.YDS / r.ATT, r.ATT / gp
+                base_ypa, attempts = r.YDS / r.ATT, workload_map.get((key, team, 'attempts'), r.ATT / gp)
                 a, b, weights = get('qb_man', key), get('qb_zone', key), mix(opp)
                 expected_ypa = base_ypa
                 detail = 'Season attempts/game × season YPA (coverage unavailable)'
@@ -283,18 +288,18 @@ def build_model(tables, cutoff, defense_weight=0.5):
             elif kind == 'season_rushing':
                 if not valid(r.ATT) or r.ATT <= 0:
                     continue
-                carries, overall = r.ATT / gp, r.YDS / r.ATT
+                carries, overall = workload_map.get((key, team, 'carries'), r.ATT / gp), r.YDS / r.ATT
                 if pos == 'QB':
                     df = defensive('QB', opp, 'Rush Yards')
                     if df is not None:
-                        add(r, 'Rushing yards', r.YDS / gp * df, r.YDS / gp, carries, 'QB season rushing yards/game × QB-specific defensive multiplier', df)
+                        add(r, 'Rushing yards', carries * overall * df, carries * overall, carries, 'QB season rushing yards/game × QB-specific defensive multiplier', df)
                     continue
                 a, b = get('rb_zone', key), get('rb_gap', key)
                 if a is None or b is None or a.Rushes + b.Rushes <= 0:
                     df = defensive('RB', opp, 'Rush Yards')
                     issue(player, 'Missing RB scheme splits; labeled CBS season-baseline fallback.')
                     if df is not None:
-                        add(r, 'Rushing yards', r.YDS / gp * df, r.YDS / gp, carries, 'Fallback: season rushing baseline × CBS RB defense', df)
+                        add(r, 'Rushing yards', carries * overall * df, carries * overall, carries, 'Fallback: season rushing baseline × CBS RB defense', df)
                     continue
                 if a.Rushes + b.Rushes > r.ATT + 1 or a['Rush Yards'] + b['Rush Yards'] > r.YDS + 2:
                     issue(player, 'Zone + gap rushing exceeds season totals; omitted.')
@@ -307,7 +312,7 @@ def build_model(tables, cutoff, defense_weight=0.5):
                 if faced is None:
                     issue(player, 'Invalid defensive run shares; rushing omitted.')
                     continue
-                expected = tuple(0.5 * x + 0.5 * y for x, y in zip(own, faced))
+                expected = tuple(0.75 * x + 0.25 * y for x, y in zip(own, faced))
                 rates = [(split['Rush Yards'] + 20 * overall) / (split.Rushes + 20) for split in (a, b)]
                 dfs = [factor(runs.loc[opp, col], runs[col].median()) for col in ['Def Zone YAPG', 'Def Gap YAPG']]
                 if any(v is None for v in dfs):
@@ -323,7 +328,7 @@ def build_model(tables, cutoff, defense_weight=0.5):
                 if not all(valid(r[c]) for c in ['TGTS', 'REC']) or r.TGTS <= 0 or r.REC < 0 or r.REC > r.TGTS:
                     issue(player, 'Invalid receiving targets/receptions; omitted.')
                     continue
-                base_targets, base_catch, base_ypt = r.TGTS / gp, r.REC / r.TGTS, r.YDS / r.TGTS
+                base_targets, base_catch, base_ypt = workload_map.get((key, team, 'targets'), r.TGTS / gp), r.REC / r.TGTS, r.YDS / r.TGTS
                 target_count, catches, yards = base_targets, base_targets * base_catch, base_targets * base_ypt
                 neutral_catches, neutral_yards = catches, yards
                 has_coverage = False
@@ -358,11 +363,20 @@ def build_model(tables, cutoff, defense_weight=0.5):
                         issue(player, 'Missing receiving coverage split; season receiving baseline used.')
                 for stat, production, neutral, col in [('Receiving yards', yards, neutral_yards, 'Rec Yards'), ('Receptions', catches, neutral_catches, 'Receptions')]:
                     df = defensive(pos, opp, col)
+                    if pos == 'RB' and stat == 'Receiving yards':
+                        volume_factor = defensive('RB', opp, 'Receptions')
+                        allowed = tables['cbs_allowed_rb'].copy()
+                        allowed['YPCatch'] = allowed['Rec Yards'] / allowed['Receptions'].replace(0, float('nan'))
+                        opponent_row = allowed[allowed.Team == opp]
+                        efficiency_factor = None if opponent_row.empty else factor(opponent_row.iloc[0]['YPCatch'], allowed.YPCatch.median())
+                        df = None if volume_factor is None or efficiency_factor is None else volume_factor * efficiency_factor
+                        detail = 'Projected targets × catch rate × yards/catch; defense catch volume and yards/catch adjusted separately'
                     if df is None:
                         issue(player, f'Missing valid {pos} defensive {stat} benchmark; omitted.')
                     else:
                         add(r, stat, production * df, neutral, target_count, detail, df, scheme_known=has_coverage)
-    return pd.DataFrame(output), pd.DataFrame(issues, columns=['Player / Team', 'Issue']).drop_duplicates()
+    result = apply_matchup_layers(pd.DataFrame(output), tables, issues)
+    return result, pd.DataFrame(issues, columns=['Player / Team', 'Issue']).drop_duplicates()
 
 
 def matchup_rating(projection, neutral):
@@ -601,6 +615,7 @@ def result_from_actual(side, line, actual):
 def picks_page():
     st.subheader('🎯 My Picks')
     select_pick_ui(st.session_state.projections,st.session_state.props)
+    matchup_review_ui()
     manual_prop_entry_ui()
     st.divider()
     st.caption('Saved lines and projections stay frozen. Use All Model Picks to import results for all three records, or grade a personal pick manually.')
@@ -636,7 +651,7 @@ def picks_page():
     d['Record Scope']=['Official' if official_pick(p) else ('Pilot' if record_week(p)==(2026,6) else 'Not in cumulative') for p in picks]
     status = st.selectbox('Show results', ['All', 'Pending', 'Needs review', 'Won', 'Lost', 'Push', 'Void'])
     visible = d if status == 'All' else d[d.Result == status]
-    columns = ['Player', 'Team', 'Opponent', 'Stat', 'Bookmaker', 'Line', 'Your Pick', 'Projection When Picked', 'Result', 'Actual', 'Injury Alert', 'Record Scope', 'Saved At']
+    columns = ['Player', 'Team', 'Opponent', 'Stat', 'Bookmaker', 'Line', 'Your Pick', 'Projection When Picked', 'Original Model Projection', 'Manual Projection Override', 'Pick Source', 'Result', 'Actual', 'Injury Alert', 'Record Scope', 'Saved At']
     styled_table(visible.reindex(columns=columns))
     st.download_button('Download my picks', d.drop(columns=['Result History'], errors='ignore').to_csv(index=False), 'my_picks.csv', 'text/csv')
     if is_admin():
@@ -1360,8 +1375,10 @@ def restore_saved_state(force=False):
         s.projections,s.issues=pd.DataFrame(),pd.DataFrame()
         s.model_meta=None
         if s.batch_meta and s.csv_confirmed and REQUIRED <= tables.keys():
+            load_injuries()
+            ensure_recent_workloads(int(s.batch_meta['season']), int(s.batch_meta['cutoff']), tables)
             s.projections,s.issues=build_model(tables,int(s.batch_meta['cutoff']))
-            s.model_meta={**s.batch_meta,'model_version':MODEL_VERSION,'defense_weight':0.5}
+            s.model_meta={**s.batch_meta,'model_version':MODEL_VERSION,'defense_weight':0.632}
     props,_=read_saved_props()
     if force or s.props.empty:
         s.props=props
@@ -1646,7 +1663,11 @@ def sync_injury_exclusions():
 
 def save_injury(entry):
     entry=dict(entry)
-    if entry['Status']=='Out':entry['Exclude Props']=True
+    if entry['Status']=='Out':
+        entry['Exclude Props']=True
+        entry['Expected workload percentage']=0
+    percent=float(entry.get('Expected workload percentage',100))
+    if not 0 <= percent <= 100:raise ValueError('Expected workload percentage must be between 0 and 100.')
     data,version=load_injuries()
     identifier=hashlib.sha256(json.dumps([entry['Season'],entry['Week'],entry['Team'],entry['Key']]).encode()).hexdigest()[:24]
     previous=data['entries'].get(identifier)
@@ -1664,7 +1685,7 @@ def save_injury(entry):
 
 def injuries_page():
     st.subheader('🩺 Weekly injury room')
-    st.caption('Enter key offensive or defensive injuries by game. This release handles notes and prop eligibility only—no touches are redistributed and projection formulas do not change.')
+    st.caption('Expected workload percentage reduces projected opportunities. Removed carries and targets are redistributed separately within the position group using recent usage. Recalculate projections after saving changes.')
     s=st.session_state
     if st.button('Load / refresh injury notes'):
         try:
@@ -1732,6 +1753,7 @@ def injuries_page():
     status=st.selectbox('Status',statuses,index=statuses.index(note['Status']) if note else 0,key='injury_status_'+team+'_'+player_key(player))
     default=note.get('Exclude Props') if note and note['Status']==status else status in {'Out','Limited / snap count'}
     excluded=st.checkbox('Exclude this player’s props this week',value=True if status=='Out' else bool(default),disabled=status=='Out',key='injury_exclude_'+team+'_'+player_key(player)+'_'+status)
+    workload_percent=st.number_input('Expected workload percentage',0.0,100.0,0.0 if status=='Out' else float((note or {}).get('Expected workload percentage',50 if status=='Limited / snap count' else 100)),disabled=status=='Out',key='injury_workload_'+team+'_'+player_key(player)+'_'+status)
     notes=st.text_area('Notes / reason',value=note.get('Notes','') if note else '',key='injury_notes_'+team+'_'+player_key(player))
     st.caption('Out always excludes props. Limited defaults to excluded. Questionable and missed practice do not automatically mean Out. Imported lines stay saved; saved personal picks receive an alert.')
     if st.button('Save injury entry',type='primary'):
@@ -1740,8 +1762,8 @@ def injuries_page():
                 raise ValueError('Enter a player name.')
             save_injury({'Season':int(season),'Week':int(week),'Team':team,'Opponent':b if team==a else a,
                          'Player':player.strip(),'Key':player_key(player),'Position':position,'Status':status,
-                         'Exclude Props':bool(excluded),'Notes':notes.strip()})
-            st.success('Injury saved for this week only. Pregame prop exclusions applied; projection formulas unchanged.')
+                         'Exclude Props':bool(excluded),'Expected workload percentage':float(workload_percent),'Notes':notes.strip()})
+            st.success('Injury saved for this week only. Pregame exclusions applied. Recalculate projections to update workloads.')
             st.rerun()
         except (RuntimeError,ValueError) as error:
             st.error(str(error))
@@ -1836,6 +1858,338 @@ def app_style():
     <div class="hero-caption">Explore the matchup. Choose your side. Track what happens.</div></div>''',unsafe_allow_html=True)
 
 
+# v7 inputs are optional for migration; missing layers are reported, never invented.
+EXTRA_DATASETS = {
+    'QB under pressure': 'pressure_qb', 'Offensive pressure allowed': 'pressure_offense',
+    'Defensive pressure generated': 'pressure_defense', 'Receiver air yards / YAC': 'receiver_ngs',
+    'Defensive box alignment': 'box_defense', 'RB vs fewer than 7': 'box_light',
+    'RB vs exactly 7': 'box_seven', 'RB vs 8+': 'box_heavy',
+    'Favorable WR–CB matchups': 'matchup_best', 'Unfavorable WR–CB matchups': 'matchup_worst',
+    'Weekly workload logs (optional fallback)': 'weekly_workload',
+}
+EXTRA_KINDS = set(EXTRA_DATASETS.values())
+DATASETS.update(EXTRA_DATASETS)
+
+
+def parse_extra(raw, kind):
+    rows = list(csv.reader(io.StringIO(raw.decode('utf-8-sig'))))
+    if kind == 'weekly_workload':
+        d = pd.read_csv(io.BytesIO(raw))
+        required = {'season','week','player_display_name','team','attempts','carries','targets'}
+        if not required <= set(d):raise ValueError('Weekly logs require: '+', '.join(sorted(required)))
+        return d
+    if kind in {'pressure_offense','pressure_defense'}:
+        records=[]
+        # Supports the supplied stacked rank / team / rate layout and ordinary tables.
+        for i,row in enumerate(rows):
+            if len(row)>1 and row[1].strip().endswith('%') and i:
+                code=team_code(rows[i-1][1])
+                if code:
+                    records.append({'Team':code,'Pressure Rate':float(row[1].strip('%'))/100})
+        if not records:
+            h=next((i for i,r in enumerate(rows) if 'Team' in r and '2026' in r),None)
+            if h is None:raise ValueError('Cannot find Team and season pressure columns.')
+            names=rows[h];ti,vi=names.index('Team'),names.index('2026')
+            for row in rows[h+1:]:
+                if len(row)>max(ti,vi) and team_code(row[ti]):
+                    records.append({'Team':team_code(row[ti]),'Pressure Rate':float(row[vi].strip('%'))/100})
+        d=pd.DataFrame(records)
+        if d.empty or d.Team.duplicated().any() or not d['Pressure Rate'].between(0,1).all():
+            raise ValueError('Need unique teams and valid pressure percentages.')
+        return d
+    anchor = 'PLAYER NAME' if kind=='receiver_ngs' else ('Team' if kind=='box_defense' else 'Player')
+    h=next((i for i,r in enumerate(rows) if anchor in r),None)
+    if h is None:raise ValueError('Cannot find '+anchor+' header.')
+    names=[]
+    for i,name in enumerate(rows[h]):
+        name=name.strip() or 'Unused '+str(i)
+        if name in names:name+=' Opponent'
+        names.append(name)
+    d=pd.DataFrame([r[:len(names)]+['']*max(0,len(names)-len(r)) for r in rows[h+1:] if any(r)],columns=names)
+    # User requested the malformed NGS error column be ignored completely.
+    d=d.drop(columns=[c for c in d if '#ERROR' in c],errors='ignore')
+    if kind=='receiver_ngs':d=d.rename(columns={'PLAYER NAME':'Player','TEAM':'Team','POS':'Position'})
+    if kind=='box_defense':
+        required={'Team','Light Box Rate','Heavy Box Rate'}
+    elif kind.startswith('box_'):required={'Player','Rushes','Rush Yards','Yards Per Carry'}
+    elif kind=='pressure_qb':required={'Player','Plays','ADoT','YPA','Pass Yards','Comp %'}
+    elif kind.startswith('matchup_'):required={'Player','Team','Team Opponent','Projected Matchup','Weekly Matchup Score'}
+    else:required={'Player','Team','TAY','REC','TAR','YAC/R','xYAC/R'}
+    if not required <= set(d):raise ValueError('Missing columns: '+', '.join(sorted(required-set(d))))
+    numeric_anchor = 'Light Box Rate' if kind=='box_defense' else ('Rushes' if kind.startswith('box_') else ('Plays' if kind=='pressure_qb' else ('Weekly Matchup Score' if kind.startswith('matchup_') else 'TAR')))
+    d=d[number(d[numeric_anchor]).notna()].copy()
+    textcols={'Player','Team','Team Opponent','Position','Projected Matchup'}
+    for c in d:
+        if c not in textcols:d[c]=number(d[c])
+    for c in ['Team','Team Opponent']:
+        if c in d:
+            d[c]=d[c].map(team_code)
+            if d[c].isna().any():raise ValueError('Unrecognized team in '+c)
+    if 'Player' in d:
+        d['Player']=d.Player.str.replace(r'^\s*\d+\s*','',regex=True).str.strip()
+        d['Key']=d.Player.map(player_key)
+        if not kind.startswith('matchup_') and d.Key.duplicated().any():raise ValueError('Duplicate player rows.')
+    if kind=='box_defense':
+        if d.Team.duplicated().any():raise ValueError('Duplicate teams.')
+        if not (d['Light Box Rate'].between(0,100)&d['Heavy Box Rate'].between(0,100)&((d['Light Box Rate']+d['Heavy Box Rate'])<=100)).all():raise ValueError('Invalid box percentages.')
+    if d.empty:raise ValueError('No usable rows.')
+    return d.reset_index(drop=True)
+
+
+@st.cache_data(ttl=3600,show_spinner=False)
+def recent_workload_feed(season):
+    stats=download_csv(f'https://github.com/nflverse/nflverse-data/releases/download/stats_player/stats_player_week_{season}.csv')
+    stats.attrs['participation_note']='Snap-count supplement unavailable; recent workload uses recorded statistical games.'
+    try:
+        snaps=download_csv(f'https://github.com/nflverse/nflverse-data/releases/download/snap_counts/snap_counts_{season}.csv')
+        if not {'season','week','team','player','offense_snaps','game_type'}<=set(snaps):return stats
+        snaps=snaps[(number(snaps.season)==season)&snaps.game_type.eq('REG')&(number(snaps.offense_snaps)>0)].copy()
+        # Fill a zero-opportunity game only after that team-week has published stats.
+        teamweeks={(team_code(r.team),int(r.week)) for _,r in stats.iterrows()}
+        seen={(player_key(r.player_display_name),team_code(r.team),int(r.week)) for _,r in stats.iterrows()}
+        additions=[]
+        for _,r in snaps.iterrows():
+            identity=(player_key(r.player),team_code(r.team),int(r.week))
+            if (identity[1],identity[2]) not in teamweeks or identity in seen:continue
+            additions.append({'player_display_name':r.player,'team':r.team,'season':season,'week':int(r.week),'season_type':'REG','attempts':0,'carries':0,'targets':0})
+            seen.add(identity)
+        if additions:stats=pd.concat([stats,pd.DataFrame(additions)],ignore_index=True)
+        stats.attrs['participation_note']=''
+    except (RuntimeError,ValueError,KeyError,TypeError):pass
+    return stats
+
+
+def ensure_recent_workloads(season,cutoff,tables):
+    if 'weekly_workload' in tables:
+        st.session_state.workload_feed=tables['weekly_workload']
+        st.session_state.workload_feed_error=None
+        return
+    try:
+        st.session_state.workload_feed=recent_workload_feed(season)
+        st.session_state.workload_feed_error=None
+    except (RuntimeError,ValueError,OSError) as error:
+        st.session_state.workload_feed=pd.DataFrame()
+        st.session_state.workload_feed_error=str(error)
+
+
+def availability(key,team):
+    s=st.session_state;meta=s.get('batch_meta') or s.get('model_meta') or {}
+    for note in s.get('injury_data',{}).get('entries',{}).values():
+        if note.get('Key')==key and note.get('Team')==team and note.get('Season')==meta.get('season') and note.get('Week')==meta.get('week'):
+            if note.get('Status')=='Out':return 0.0
+            return max(0,min(1,float(note.get('Expected workload percentage',100))/100))
+    return 1.0
+
+
+def projected_workloads(tables,cutoff):
+    result={};notes=[];roster={};recent={}
+    s=st.session_state;meta=s.get('batch_meta') or s.get('model_meta') or {}
+    logs=tables.get('weekly_workload',s.get('workload_feed',pd.DataFrame())).copy()
+    fields={'attempts','carries','targets'}
+    required={'season','week','player_display_name','team'}|fields
+    if logs.attrs.get('participation_note'):
+        notes.append({'Player / Team':'Workload','Issue':logs.attrs['participation_note']})
+    if not logs.empty and required<=set(logs):
+        logs=logs[(number(logs.season)==int(meta.get('season',2026)))&(number(logs.week)<=cutoff)&(number(logs.week)>0)].copy()
+        if 'season_type' in logs:logs=logs[logs.season_type.eq('REG')]
+        logs['Key']=logs.player_display_name.map(player_key);logs['Team']=logs.team.map(team_code)
+        # A duplicated player-week is ambiguous; never count the game twice.
+        logs=logs.drop_duplicates(['Key','week'],keep=False)
+        for (key,team),g in logs.groupby(['Key','Team']):
+            g=g.sort_values('week').tail(3)
+            for field in fields:
+                values=number(g[field])
+                if values.notna().all() and (values>=0).all():recent[key,team,field]=float(values.mean())
+    else:notes.append({'Player / Team':'Workload','Issue':'Weekly logs unavailable or invalid: season-only workload fallback. Upload weekly workload logs or retry public feed.'})
+    for kind,field,col in [('season_passing','attempts','ATT'),('season_rushing','carries','ATT'),('season_receiving','targets','TGTS')]:
+        for _,r in tables[kind].iterrows():
+            if pd.isna(r.GP) or r.GP<=0 or r.GP>cutoff or pd.isna(r[col]):continue
+            baseline=float(r[col]/r.GP);last=recent.get((r.Key,r.Team,field))
+            amount=baseline if last is None else .5*baseline+.5*last
+            result[r.Key,r.Team,field]=amount*availability(r.Key,r.Team)
+            roster[r.Key,r.Team,field]=(r.Position,amount,last if last is not None else baseline)
+            if last is None:notes.append({'Player / Team':r.Player,'Issue':'No matching recent '+field+' logs; season workload used.'})
+    # Released opportunities go only to healthy same-position teammates, weighted by recent use.
+    for team in TEAM_NAMES:
+        for position in ['RB','WR','TE']:
+            for field in ['carries','targets']:
+                group=[(k,v) for k,v in roster.items() if k[1]==team and k[2]==field and v[0]==position]
+                for donor,donor_data in group:
+                    released=donor_data[1]*(1-availability(donor[0],team))
+                    if not released:continue
+                    eligible=[(k,v) for k,v in group if k!=donor and availability(k[0],team)>0]
+                    total=sum(v[2]*availability(k[0],team) for k,v in eligible)
+                    if total>0:
+                        for k,v in eligible:result[k]+=released*v[2]*availability(k[0],team)/total
+                    else:notes.append({'Player / Team':team+' '+position,'Issue':'No eligible teammate usage to allocate released '+field+'; left unassigned.'})
+    return result,notes
+
+
+def apply_matchup_layers(result,tables,issues):
+    if result.empty:return result
+    def warn(who,msg):issues.append({'Player / Team':who,'Issue':msg})
+    def lookup(kind,key,column='Key'):
+        d=tables.get(kind)
+        if d is None:return None
+        m=d[d[column]==key]
+        return None if m.empty else m.iloc[0]
+    pressure={}
+    for _,r in tables['season_passing'].iterrows():
+        offense=lookup('pressure_offense',r.Team,'Team')
+        # Opponent comes from the verified current-week source.
+        run=lookup('defensive_run_splits',r.Team,'Team')
+        defense=None if run is None else lookup('pressure_defense',run.Opponent,'Team')
+        qb=lookup('pressure_qb',r.Key)
+        if offense is None or defense is None or qb is None or not r.ATT>0:continue
+        usual=float(offense['Pressure Rate']);expected=.5*(usual+float(defense['Pressure Rate']))
+        baseline=r.YDS/r.ATT
+        if not baseline>0 or not pd.notna(qb.YPA) or usual>=.95:continue
+        # Approximation: team pressured-dropback share proxies this QB's pressured-attempt share.
+        # Compare to the usual baseline rather than applying pressure a second time.
+        reliability=max(0,float(qb.Plays))/(max(0,float(qb.Plays))+20)
+        sensitivity=(float(qb.YPA)/baseline-1)/max(.05,1-usual)
+        adjustment=max(-.127,min(.07,(expected-usual)*sensitivity*reliability))
+        pressure[r.Team]={'usual':usual,'expected':expected,'delta':expected-usual,'adjustment':adjustment,'adot':qb.ADoT}
+    for i,r in result.iterrows():
+        original=float(r.Projection);value=original
+        result.loc[i,'Pressure Adjustment']=0.0
+        result.loc[i,'Box Weight']=0.0
+        if r.Position=='RB' and r.Stat=='Rushing yards':
+            defense=lookup('box_defense',r.Opponent,'Team')
+            splits=[lookup(k,r.Key) for k in ['box_light','box_seven','box_heavy']]
+            season=lookup('season_rushing',r.Key)
+            if defense is not None and season is not None and season.ATT>0 and all(x is not None for x in splits):
+                overall=season.YDS/season.ATT
+                light=float(defense['Light Box Rate'])/100;heavy=float(defense['Heavy Box Rate'])/100
+                weights=[light,1-light-heavy,heavy]
+                rates=[(x['Rush Yards']+20*overall)/(x.Rushes+20) for x in splits]
+                if all(math.isfinite(float(x)) and x>=0 for x in rates):
+                    box_ypc=sum(w*v for w,v in zip(weights,rates))
+                    value=.68*value+.32*float(r['Workload / Game'])*box_ypc
+                    result.loc[i,'Box Weight']=.32
+                    result.loc[i,'Calculation']+='; 68% scheme / 32% box; box splits use 20-carry priors'
+            else:warn(r.Player,'Box split/alignment unavailable; full scheme estimate retained.')
+        context=pressure.get(r.Team)
+        if r.Stat=='Passing yards':
+            if context:
+                value*=1+context['adjustment']
+                result.loc[i,'Pressure Adjustment']=context['adjustment']
+                result.loc[i,'Calculation']+=f"; pressure {context['usual']:.1%} → {context['expected']:.1%}; adjustment {context['adjustment']:+.1%}; team dropback-rate proxy"
+            else:warn(r.Player,'Pressure inputs unavailable; no pressure adjustment.')
+        elif r.Position in {'WR','TE'} and r.Stat in {'Receiving yards','Receptions'}:
+            ngs=lookup('receiver_ngs',r.Key)
+            peers=tables.get('receiver_ngs')
+            if context and ngs is not None and ngs.Team==r.Team and pd.notna(context['adot']) and peers is not None:
+                # Role-fit heuristic, not observed receiver production on pressured plays.
+                # Weighted team target depth is the usual reference; no QB-total scaling.
+                teammates=peers[peers.Team==r.Team]
+                usual_depth=(teammates.TAY*teammates.TAR).sum()/max(1,teammates.TAR.sum())
+                shift=context['delta']*(float(context['adot'])-usual_depth)
+                depth_fit=max(-1,min(1,(usual_depth-float(ngs.TAY))/8))
+                opportunities=max(-.06,min(.06,-shift*depth_fit*.15))
+                adjustment=opportunities
+                if r.Stat=='Receiving yards':
+                    # Reward creating YAC beyond expectation only when modeled short opportunities increase.
+                    excess=float(ngs['YAC/R'])-float(ngs['xYAC/R'])
+                    adjustment+=abs(opportunities)*max(-.5,min(.5,excess/5))
+                adjustment=max(-.08,min(.08,adjustment))
+                value*=1+adjustment
+                result.loc[i,'Pressure Adjustment']=adjustment
+                result.loc[i,'Calculation']+='; individual target-depth/YAC fit heuristic; no QB-total scaling'
+        result.loc[i,'Projection']=round(max(0,value),4)
+        result.loc[i,'Matchup Rating']=matchup_rating(max(0,value),r['Neutral Projection'])
+    return result
+
+
+def matchup_candidates():
+    s=st.session_state;meta=s.get('model_meta') or {}
+    lines=prop_comparisons(s.projections,s.props)
+    records=[]
+    for kind,desired in [('matchup_best','Over'),('matchup_worst','Under')]:
+        matchups=s.tables.get(kind,pd.DataFrame())
+        for _,m in matchups.iterrows():
+            matches=lines[(lines.Key==m.Key)&(lines.Team==m.Team)&(lines.Opponent==m['Team Opponent'])&(lines.Stat=='Receiving yards')&(lines.Bookmaker=='DraftKings')] if not lines.empty else pd.DataFrame()
+            identifier=hashlib.sha256(json.dumps([meta.get('season'),meta.get('week'),m.Key,m.Team,desired]).encode()).hexdigest()[:24]
+            record={'Review ID':identifier,'Player':m.Player,'Team':m.Team,'Opponent':m['Team Opponent'],'Cornerback':m['Projected Matchup'],'Matchup Score':m['Weekly Matchup Score'],'Suggested Side':desired,'Source':kind,'Row':None,'Status':'No matching model projection / DraftKings prop'}
+            if not matches.empty:
+                row=matches.sort_values('Fetched',ascending=False).iloc[0]
+                record['Row']=row
+                if started({'Kickoff (UTC)':row['Kickoff (UTC)']}):record['Status']='Game started — locked'
+                elif injury_blocks(row.Player,row.Team):record['Status']='Injury exclusion — blocked'
+                else:
+                    direction=pick_direction(row.Stat,float(row.Projection),float(row.Line))
+                    record['Status']='Agrees' if direction==desired else 'Review required'
+            records.append(record)
+    # Contradictory lists must be reviewed; never automatically save opposing picks.
+    byplayer={}
+    for item in records:byplayer.setdefault((item['Team'],player_key(item['Player'])),set()).add(item['Suggested Side'])
+    for item in records:
+        if len(byplayer[item['Team'],player_key(item['Player'])])>1 and item['Row'] is not None and item['Status'] in {'Agrees','Review required'}:
+            item['Status']='Conflicting lists — review required'
+    return records
+
+
+def save_matchup_pick(item,override=None):
+    s=st.session_state;row=item['Row'];meta=s.model_meta
+    if row is None or started({'Kickoff (UTC)':row['Kickoff (UTC)']}):raise ValueError('Need an upcoming matched prop.')
+    if s.get('injury_load_error') or injury_blocks(row.Player,row.Team):raise ValueError('Injury eligibility blocks this pick.')
+    projection=float(row.Projection) if override is None else float(override)
+    side=item['Suggested Side']
+    direction=pick_direction(row.Stat,projection,float(row.Line))
+    if direction!=side:raise ValueError('Adjusted projection must clear the configured no-pick range on the chosen side.')
+    raw=github('data/my_picks.json');picks=json.loads(raw) if raw else []
+    if any(p.get('Event ID')==row['Event ID'] and player_key(p['Player'])==row.Key and p['Stat']==row.Stat and p.get('Your Pick')==side for p in picks):return False
+    lines=s.props.copy()
+    lines['Key']=lines.Player.map(player_key)
+    matching=lines[(lines['Event ID']==row['Event ID'])&(lines.Key==row.Key)&(lines.Stat==row.Stat)&(lines.Line==row.Line)&(lines.Side==side)&(lines.Bookmaker==row.Bookmaker)]
+    odds=None if matching.empty else float(matching.iloc[0].Odds)
+    pid=hashlib.sha256(json.dumps([row['Event ID'],row.Key,row.Stat,float(row.Line),row.Bookmaker,side]).encode()).hexdigest()[:24]
+    record={'ID':pid,'Player':row.Player,'Position':row.Position,'Team':row.Team,'Opponent':row.Opponent,'Stat':row.Stat,'Line':float(row.Line),'Your Pick':side,'Projection When Picked':projection,'Original Model Projection':float(row.Projection),'Manual Projection Override':override is not None,'Pick Source':item['Source'],'Matchup Score':float(item['Matchup Score']),'Cornerback':item['Cornerback'],'Odds':odds,'Bookmaker':row.Bookmaker,'Event ID':row['Event ID'],'Kickoff (UTC)':row['Kickoff (UTC)'],'Saved At':utc_now().isoformat(),'Result':'Pending','Actual':None,'Model Version':MODEL_VERSION,'Result History':[],'Season':meta['season'],'Week':meta['week'],'Day':local_day(row['Kickoff (UTC)']),'Manual Grade':False}
+    picks.append(record)
+    github('data/my_picks.json',json.dumps(picks,allow_nan=False).encode(),expected_hash=hashlib.sha256(raw).hexdigest() if raw else 'missing')
+    s.my_picks=picks
+    return True
+
+
+def matchup_review_ui():
+    s=st.session_state
+    if not any(k in s.tables for k in ['matchup_best','matchup_worst']):return
+    st.subheader('WR–CB matchup review')
+    st.caption('All uploaded matchup rows are included. Receiving yards only. Agreements outside the no-pick range are added to My Picks automatically when this section loads with Admin access. Overrides affect personal picks only; original model forecasts stay unchanged.')
+    if s.projections.empty or s.props.empty:
+        st.info('Calculate projections and load saved DraftKings props to match these lists.');return
+    if not is_admin():st.info('Admin access is required to add or review these picks.');return
+    try:
+        raw=github('data/matchup_decisions.json')
+        decisions=json.loads(raw) if raw else {}
+        items=matchup_candidates();added=0
+        for item in items:
+            if item['Status']=='Agrees' and item['Review ID'] not in decisions:
+                added+=int(save_matchup_pick(item))
+        if added:st.success(f'Added {added} matchup-supported picks to My Picks.')
+        display=[]
+        for item in items:
+            row=item['Row']
+            display.append({k:v for k,v in item.items() if k not in {'Row','Review ID'}}|{'Model Projection':None if row is None else row.Projection,'Line':None if row is None else row.Line,'Decision':decisions.get(item['Review ID'],{}).get('Action','')})
+        st.dataframe(pd.DataFrame(display),hide_index=True,use_container_width=True)
+        pending=[x for x in items if x['Status'] in {'Review required','Conflicting lists — review required'} and x['Review ID'] not in decisions]
+        if not pending:return
+        choice=st.selectbox('Matchup to review',range(len(pending)),format_func=lambda i:pending[i]['Player']+' · '+pending[i]['Suggested Side'])
+        item=pending[choice];row=item['Row']
+        st.write(f"Model **{row.Projection:.1f}** · Line **{row.Line:g}** · Suggested **{item['Suggested Side']}**")
+        value=st.number_input('Your adjusted receiving-yard projection',min_value=0.0,value=float(row.Projection),step=1.0,key='match_override_'+item['Review ID'])
+        a,b=st.columns(2)
+        keep=a.button('Leave model projection as is',key='match_keep_'+item['Review ID'])
+        override=b.button('Save adjusted projection and personal pick',key='match_save_'+item['Review ID'])
+        if keep or override:
+            if override:save_matchup_pick(item,value)
+            decisions[item['Review ID']]={'Action':'Keep original' if keep else 'Personal override','Original Projection':float(row.Projection),'Adjusted Projection':None if keep else value,'At':utc_now().isoformat()}
+            github('data/matchup_decisions.json',json.dumps(decisions).encode(),expected_hash=hashlib.sha256(raw).hexdigest() if raw else 'missing')
+            st.rerun()
+    except (RuntimeError,ValueError,KeyError) as error:st.error('Matchup review: '+str(error))
+
+
+
 def main():
     st.set_page_config(page_title='NFL Matchup Analytics', page_icon='🏈', layout='wide')
     for key, value in {'tables': {}, 'source_bytes': {}, 'projections': pd.DataFrame(), 'issues': pd.DataFrame(),
@@ -1876,6 +2230,7 @@ def main():
             record_policy_ui()
             persistence_controls()
             st.subheader('Weekly data batch')
+            st.caption('Upload the original season files plus the new pressure, box and matchup files. Public weekly logs supply recent workloads without Odds API credits.')
             c1, c2, c3 = st.columns(3)
             season = c1.number_input('Season', 2020, 2100, int((s.batch_meta or {}).get('season',2026)))
             cutoff = c2.number_input('Stats through week', 1, 18, int((s.batch_meta or {}).get('cutoff',6)))
@@ -1884,6 +2239,10 @@ def main():
             kind = DATASETS[label]
             uploads = st.file_uploader('Upload CSVs (one or several)', type=['csv'], accept_multiple_files=True)
             name_map = {
+                'qbs under pressure':'pressure_qb', 'official offensive pressure':'pressure_offense',
+                'defensive pressure':'pressure_defense','average targeted air':'receiver_ngs',
+                'defenses alignment':'box_defense','fewer than 7':'box_light','7 in box':'box_seven',
+                '8+ in box':'box_heavy','top 20 matchups':'matchup_best','bottom 20 matchups':'matchup_worst',
                 'te vs man': 'te_man', 'te vs zone': 'te_zone', 'wr vs man': 'wr_man', 'wr vs zone': 'wr_zone',
                 'qb vs man': 'qb_man', 'qb vs zone': 'qb_zone', 'defensive passing': 'defensive_coverage',
                 'gap schemes': 'rb_gap', 'zone schemes': 'rb_zone', 'full rb stats inc': 'rb_full',
@@ -1934,9 +2293,11 @@ def main():
                     meta = {'season': int(season), 'cutoff': int(cutoff), 'week': int(week)}
                     if not confirmed or s.batch_meta != meta or week <= cutoff:
                         raise ValueError('Confirm the batch dates. Projection week must follow the cutoff; reaccept files if dates changed.')
+                    s.batch_meta = meta
+                    ensure_recent_workloads(int(season), int(cutoff), s.tables)
                     p, issues = build_model(s.tables, int(cutoff))
                     s.projections, s.issues = p, issues
-                    s.model_meta = {**meta, 'model_version': MODEL_VERSION, 'defense_weight': 0.5,
+                    s.model_meta = {**meta, 'model_version': MODEL_VERSION, 'defense_weight': 0.632,
                                     'calculated_at': datetime.now(timezone.utc).isoformat()}
                     st.success(f'Calculated {len(p)} projections. Review Data checks before publishing.')
                     s.register_slate = True
@@ -2184,25 +2545,26 @@ def main():
                 )
 
     with methodology:
-        st.markdown("""### Projection formulas · unchanged in this interface update
-- **Player selection:** up to two WRs and one QB, TE, RB per team, ranked by primary season yards/game. QB selection carries over to QB rushing; RB selection carries over to RB receiving. This is a production filter, not a verified depth chart.
-- **WR/TE targeting:** season targets/game adjusted by opponent-weighted targets/route relative to historical route-weighted targets/route. Each coverage target rate uses a 50-route prior toward the player's combined man/zone target rate.
-- **WR/TE production:** each coverage's catch rate and yards/target use a 10-target prior toward season efficiency. Coverage contributions are weighted by expected targets, so targeting is counted once. Split targets are estimated from routes × rounded targets/route; missing splits use labeled season baselines.
-- **Defense:** multiplier = 1 + 0.5 × (opponent position-specific stat allowed/game ÷ league median allowed/game − 1). Separate medians for every stat and position; no extra caps. Zero/missing medians are flagged, not divided by.
-- **RB rushing:** expected classified zone/gap mix = 50% player's own carry shares + 50% defense's runs-faced shares, normalizing each pair. RB scheme YPC uses a 20-carry prior toward season YPC. Each scheme gets its own median-based defensive yards/game adjustment. Multiply by carries/game. Preserve unclassified carries at overall efficiency with a neutral adjustment. Do not add a second CBS rushing multiplier. Defensive yards/game is used as requested; it combines volume and efficiency.
-- **RB receiving:** targets/game × season catch rate or yards/target × matching RB defensive multiplier. No invented RB man/zone receiving splits.
-- **QB passing:** attempts/game × opponent-weighted man/zone YPA × QB passing defense multiplier. Smooth with a 20-attempt prior toward season YPA. Split attempts are estimates from passing yards/YPA; unusable estimates fall back to season YPA.
-- **QB rushing:** season rushing yards/game × QB-specific defensive rushing multiplier.
-- **Matchup rating:** compare the final forecast with the same smoothed model under the player's own scheme mix and a neutral defense. Score = 5.5 + 4.5 × tanh(log(forecast/neutral)/0.35). Neutral is 5.5; 10 is the strongest end and 1 the weakest end of this heuristic scale. It measures production matchup, not player ability or the probability of beating a line. Undefined neutral baselines show no score.
-- **Separate ratings:** defense compares the final forecast to its pre-defense forecast; coverage/scheme compares the pre-defense forecast with its neutral baseline. All use the same 1–10 transformation. Signals are Mixed when ratings lie on opposite sides of the neutral band 5.2–5.8. Missing scheme data shows — and Defense only.
-- **Interface v6:** projection formulas are unchanged. Game filters and pick entry live in My Picks. Injuries store weekly notes and prop exclusions only; no workload redistribution or injury efficiency multipliers are applied. Out excludes automatically; Limited defaults to excluded; other statuses are informational unless explicitly excluded. Saved model eligibility changes only before kickoff. Personal saved picks retain their original lines and receive injury alerts.
-- **Record policy:** 2026 Week 6 is retained as Pilot; official cumulative totals begin Week 7. Weekly history preserves all three records and model versions. Future inclusion-policy changes cannot remove started official weeks.
-- **Persistence:** accepted CSVs save immediately, validation saves their confirmation, and each successful prop fetch saves before the next game is requested. Saved inputs/props auto-restore on a new session. Imports reuse stored games unless fresh lines are explicitly requested. An empty saved batch is a clear marker and never resurrects older published CSVs. Existing picks and records are not cleared with weekly data.
-- **No-pick ranges:** defaults ±10 passing yards, ±5 receiving/rushing yards, ±0.5 receptions, inclusive at the boundary. Admin can save different ranges. These affect new registrations and current display, not already saved forecasts or personal choices. Each official pick retains its threshold.
-- **All Model / Top 20:** official forecasts are saved once per player/event/stat, using the first registered DraftKings line. Crossed-off forecasts retain an audit trail but do not count in that record. Exclusion/restore locks at kickoff. All Model exclusions also disqualify Top 20; Top 20-only exclusions do not change All Model. Top 20 ranks absolute differences across stats (different units), selects one prop per player, and blocks that player for the day when crossed off. Started slots freeze. Historical started selections are preserved even if older versions allowed several props per player. Fewer than 20 is shown when there are not enough eligible forecasts. Days use America/Los_Angeles.
-- **Automatic results:** one-click nflverse weekly-stat import plus separate ESPN completed-game confirmation; exact name/team/opponent/season/week matching. Missing players are not automatically zero; DNPs and voids require review. Later stat corrections may update grades with history. Manual grades are respected. No scheduled background job is installed.
-- **My Picks:** save your chosen side before kickoff, freezing the line, projection, odds, and timestamp. Manually mark Won/Lost/Push/Void or enter the actual completed-game stat. Record = wins/losses; hit rate excludes pushes, voids, and pending picks. Result corrections retain an audit trail. Admin password is required to write.
-- **Limits:** no injury, weather, role-change, or game-script model. Priors, 50% strengths, and rating scale are experimental settings, not fitted performance claims. Data checks flag cutoff conflicts and ambiguous names. The Records Dashboard separates the three records and breaks down model results by stat, position, and side.
+        st.markdown("""### Projection formulas · Model v7
+- **Workload:** 50% season opportunities/game + 50% opportunities over the last three available player games, through the selected cutoff. Byes do not count as zero. Offensive snap counts supplement zero-opportunity appearances when the team-week statistics are published. If snap counts are unavailable, recent usage relies on recorded statistical appearances and is flagged. Uses carries, targets and pass attempts separately. Public nflverse weekly logs are cached; upload a weekly-log fallback if unavailable. Missing or unmatched logs use a labeled season baseline. A player with fewer than three recorded games uses the available games.
+- **Injuries:** Expected workload percentage applies before redistribution. Out means 0%. Released carries and targets are allocated separately to available same-position teammates using recent usage, or season usage if recent data is unavailable. Remaining limited players receive a reduced share. No eligible recipients means opportunities remain unassigned. Recalculate after edits. Defensive injuries and offensive-line injuries remain contextual notes; no invented efficiency adjustment.
+- **Player selection:** up to two available WRs and one available QB, TE and RB per team, ranked by primary season yards/game. Out players are replaced in the display by the next eligible player. Redistribution includes the full uploaded position group, including undisplayed players.
+- **Coverage:** WR/TE projected targets are adjusted by coverage-specific targeting and catch/yardage efficiency. Target rates use 50-route priors; efficiencies use 10-target priors. Rounded split target rates are estimates. QB passing uses man/zone YPA with 20-attempt priors. Missing splits fall back to season efficiency.
+- **Defense:** multiplier = 1 + 0.632 × (opponent position/stat allowed ÷ league median − 1). Applies symmetrically. Missing benchmarks are flagged. No third-down adjustment.
+- **RB scheme:** expected zone/gap mix = 75% individual RB carry mix + 25% opponent runs-faced mix. Individual usage is a proxy for offensive play selection. Apply the RB's scheme-specific YPC, with 20-carry priors, and each scheme's defensive yards-allowed adjustment. Unclassified runs remain neutral. No additional CBS rushing multiplier when scheme data exists.
+- **RB boxes:** match fewer-than-seven, exactly-seven and eight-plus box splits to defensive light, residual seven and heavy rates. This mapping assumes the source definitions match those categories; the defensive frequencies are a tendency proxy, not a formation-conditioned forecast. Player split YPC uses 20-carry priors. Final expected YPC = 68% scheme estimate + 32% box estimate. Missing box inputs retain the scheme estimate and produce a data-check notice.
+- **RB receiving:** projected targets × season catch rate gives catches before defense. Receptions allowed adjusts catch volume; yards allowed per reception separately adjusts receiving efficiency. Receiving yards = adjusted catches × adjusted player yards/catch. Total receiving yards allowed is not applied as an additional boost.
+- **QB pressure:** expected pressure rate = equal blend of offensive pressure allowed and opponent pressure generated. Compare it with offensive pressure allowed as the usual baseline. Team pressured-dropback rate proxies the QB's pressured-attempt share. Adjustment = pressure-rate change × (pressured YPA / season YPA − 1) / (1 − usual pressure rate), tempered by plays/(plays+20), capped at −12.7%/+7%. This is an experimental approximation, not a directly measured clean-pocket model. EPA is contextual and is not converted into yards.
+- **Receiver pressure fit:** never scale receiver projections automatically to QB passing totals. Estimate target-depth shift from the change in expected pressure and the QB's pressured ADoT relative to target-weighted team receiver depth. Individual depth fit shifts receiving opportunities up to ±6%; YAC per reception above/below expectation can modify receiving yards, with the combined receiver adjustment capped at ±8%. These modest coefficients are role-fit assumptions, not observed receiver-under-pressure splits. The supplied error column is ignored; YAC difference is calculated from the two valid columns. Missing receiver data means no receiver-pressure adjustment.
+- **Ratings:** overall compares final projection with its neutral baseline using 5.5 + 4.5 × tanh(log(projection/neutral)/0.35). Defense and coverage/scheme ratings describe those components before the additional pressure/box layers. Ratings are matchup indicators, not hit probabilities.
+- **WR–CB lists:** use every uploaded row, restricted to the current week's verified opponent. Receiving-yard agreements beyond the no-pick range automatically enter My Picks under Admin access. Disagreements are shown for review. Manual overrides freeze a personal projection and preserve the original model forecast; they never rewrite All Model or Top 20 forecasts. Missing lines, injury exclusions and started games do not create automatic picks. Multiple CB rows for one receiver do not duplicate the personal pick. Conflicting lists require review.
+- **Records:** 2026 Week 6 remains Pilot; official totals begin Week 7. Existing saved projections, lines, versions and results remain frozen. New calculations use Model v7. Weekly and cumulative records remain separate.
+- **Persistence:** accepted CSVs and imported props save to GitHub. Saved props are reused unless a fresh fetch is explicitly requested. Calculation, public workload downloads and matchup review do not consume Odds API credits. Public workload logs can update independently of uploaded snapshots; saved official forecasts do not change.
+- **No-pick ranges:** default ±10 passing yards, ±5 receiving/rushing yards and ±0.5 receptions. Admin can configure thresholds. Automatic matchup picks must clear these ranges; manual review can leave the model unchanged.
+- **Top 20:** rank absolute projection-line differences, one prop per player, maximum three per team and two passing-related picks in the same direction per team. Started slots freeze. Exclusions refill with the next eligible pick; fewer than 20 is possible if candidates are exhausted.
+- **Results:** one-click public weekly-stat import with separate final-game confirmation; ambiguous or missing player records require review. Personal picks use their own saved side and line. W/L hit rate excludes pushes, voids and pending picks.
+- **Limits:** no weather or third-down model. Coverage, pressure and defensive factors can be correlated; all weights and caps are experimental settings to evaluate prospectively. Missing data and date conflicts appear in Data checks.
+
 """)
     st.divider()
     st.caption('NFL Matchup Analytics — Independent sports analytics project — Created by Owen Dunne')
